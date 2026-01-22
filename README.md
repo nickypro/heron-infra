@@ -24,7 +24,7 @@ Test it:
 
 ```bash
 python3 scripts/monitor.py
-python3 scripts/check_instances.py
+python3 scripts/show_instances.py
 ```
 
 Install cron jobs:
@@ -37,12 +37,12 @@ Install cron jobs:
 
 - `monitor.py` - collects GPU stats, updates `~/.ssh/config`, tracks costs (every minute)
 - `terminate_idle_instances.py` - shuts down instances at 0% GPU for too long (every 5 min)
-- `check_availability.py` - tracks instance type availability by region (every 10 min)
+- `monitor_availability.py` - tracks instance type availability by region (every 10 min)
 - `backup.py` - rsyncs home directories to `./backup/` (every 30 min)
-- `check_instances.py` - shows current instance status (manual)
-- `check_usage.py` - shows cost per SSH key by time period (manual)
+- `show_instances.py` - shows current instance status (manual)
+- `show_usage.py` - shows cost per SSH key by time period (manual)
 
-## check_instances.py
+## show_instances.py
 
 ```
   Lambda Instance Status  │  2026-01-22 16:32:38  │  Idle threshold: 2.0h
@@ -57,12 +57,12 @@ Install cron jobs:
 
 Use `--json` for JSON output.
 
-## check_availability.py
+## monitor_availability.py
 
 See what instance types are available right now:
 
 ```bash
-python3 scripts/check_availability.py
+python3 scripts/monitor_availability.py
 ```
 
 ```
@@ -78,8 +78,8 @@ python3 scripts/check_availability.py
 Track availability over time:
 
 ```bash
-python3 scripts/check_availability.py --record     # record current state
-python3 scripts/check_availability.py --history 24 # show last 24 hours
+python3 scripts/monitor_availability.py --record     # record current state
+python3 scripts/monitor_availability.py --history 24 # show last 24 hours
 ```
 
 ## Config

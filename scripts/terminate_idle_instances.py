@@ -9,8 +9,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import db
-import lambda_api
+import utils_db as db
+import utils_lambda_api as lambda_api
 
 PROJECT_DIR = Path(__file__).parent.parent
 

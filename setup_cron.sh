@@ -65,7 +65,7 @@ MANAGED_BLOCK="$MARKER_START
 */5 * * * * cd $SCRIPT_DIR/scripts && $PYTHON terminate_idle_instances.py >> $SCRIPT_DIR/logs/terminate.log 2>&1
 #
 # Availability: track instance type availability by region
-*/10 * * * * cd $SCRIPT_DIR/scripts && $PYTHON check_availability.py --record >> $SCRIPT_DIR/logs/availability.log 2>&1
+*/10 * * * * cd $SCRIPT_DIR/scripts && $PYTHON monitor_availability.py --record >> $SCRIPT_DIR/logs/availability.log 2>&1
 #
 # Backup: rsync instance home directories
 */30 * * * * cd $SCRIPT_DIR/scripts && $PYTHON backup.py >> $SCRIPT_DIR/logs/backup.log 2>&1

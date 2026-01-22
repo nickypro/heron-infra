@@ -9,7 +9,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import db
+import utils_db as db
 
 PROJECT_DIR = Path(__file__).parent.parent
 
@@ -46,7 +46,7 @@ def get_usage_by_key(conn, since_timestamp: float) -> dict:
     if not samples:
         return {}
     
-    # Get instance info (hourly cost, ssh keys)
+    # Get instance info (hourly cost, ssh keys) - includes terminated instances
     instances = {}
     for row in conn.execute("SELECT * FROM instances").fetchall():
         inst = dict(row)
@@ -58,6 +58,7 @@ def get_usage_by_key(conn, since_timestamp: float) -> dict:
             "ssh_key": ssh_keys[0] if ssh_keys else "unknown",
             "name": inst.get("hostname") or inst.get("name") or inst["id"][:8],
             "type": inst.get("instance_type", "unknown"),
+            "status": inst.get("status", "unknown"),
         }
     
     # Group samples by instance and count time slots (each sample = ~1 minute)
@@ -66,10 +67,11 @@ def get_usage_by_key(conn, since_timestamp: float) -> dict:
         instance_minutes[sample["instance_id"]] += 1
     
     # Calculate cost per SSH key
-    usage_by_key = defaultdict(lambda: {"cost_cents": 0, "hours": 0, "instances": set()})
+    usage_by_key = defaultdict(lambda: {"cost_cents": 0, "hours": 0, "instances": {}})
     
     for instance_id, minutes in instance_minutes.items():
         if instance_id not in instances:
+            # Instance not in DB (shouldn't happen, but handle gracefully)
             continue
         
         inst = instances[instance_id]
@@ -79,11 +81,15 @@ def get_usage_by_key(conn, since_timestamp: float) -> dict:
         
         usage_by_key[ssh_key]["cost_cents"] += cost_cents
         usage_by_key[ssh_key]["hours"] += hours
-        usage_by_key[ssh_key]["instances"].add(inst["name"])
+        # Store instance with its hours and status
+        usage_by_key[ssh_key]["instances"][inst["name"]] = {
+            "hours": hours,
+            "status": inst["status"],
+        }
     
-    # Convert sets to lists for JSON serialization
+    # Convert instance dicts to lists for JSON serialization
     for key in usage_by_key:
-        usage_by_key[key]["instances"] = list(usage_by_key[key]["instances"])
+        usage_by_key[key]["instances"] = dict(usage_by_key[key]["instances"])
     
     return dict(usage_by_key)
 
@@ -178,9 +184,13 @@ def main():
                 print("  Hours by instance (24h):")
                 for key in sorted_keys:
                     data = usage_data["24h"].get(key, {})
-                    if data.get("hours", 0) > 0:
-                        instances = ", ".join(data.get("instances", []))
-                        print(f"    {key}: {format_duration(data['hours'])} ({instances})")
+                    instances = data.get("instances", {})
+                    if instances:
+                        print(f"    {key}:")
+                        for inst_name, inst_data in sorted(instances.items(), key=lambda x: x[1]["hours"], reverse=True):
+                            status = inst_data.get("status", "unknown")
+                            status_icon = "●" if status == "active" else "○"
+                            print(f"      {status_icon} {inst_name}: {format_duration(inst_data['hours'])}")
                 print()
         
     finally:

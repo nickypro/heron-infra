@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import db
+import utils_db as db
 
 PROJECT_DIR = Path(__file__).parent.parent
 

@@ -30,6 +30,7 @@ def load_config():
 
 
 CONFIG = load_config()
+MIN_RUNTIME_HOURS = float(CONFIG.get("MIN_RUNTIME_HOURS", "4"))
 IDLE_SHUTDOWN_HOURS = float(CONFIG.get("IDLE_SHUTDOWN_HOURS", "2"))
 
 
@@ -76,11 +77,29 @@ def group_samples_by_timestamp(samples: list[dict], tolerance: float = 30.0) -> 
 
 def check_and_terminate_idle(conn, instance: dict, dry_run: bool = False) -> bool:
     """
-    Check if instance should be terminated due to idle GPU.
-    For multi-GPU instances, ALL GPUs must be at 0% to be considered idle.
+    Check if instance should be terminated. Both conditions must be met:
+    1. Running for at least MIN_RUNTIME_HOURS
+    2. Idle (all GPUs at 0%) for at least IDLE_SHUTDOWN_HOURS
+    
     Returns True if instance was (or would be) terminated.
     """
-    cutoff = time.time() - (IDLE_SHUTDOWN_HOURS * 3600)
+    name = instance["hostname"] or instance["id"][:8]
+    now = time.time()
+    
+    # Condition 1: Check minimum runtime
+    first_seen = instance.get("first_seen")
+    if not first_seen:
+        log(f"  {name}: No first_seen timestamp, skipping")
+        return False
+    
+    runtime_hours = (now - first_seen) / 3600
+    if runtime_hours < MIN_RUNTIME_HOURS:
+        remaining = MIN_RUNTIME_HOURS - runtime_hours
+        log(f"  {name}: Running {runtime_hours:.1f}h (need {MIN_RUNTIME_HOURS}h min, {remaining:.1f}h to go)")
+        return False
+    
+    # Condition 2: Check idle time
+    cutoff = now - (IDLE_SHUTDOWN_HOURS * 3600)
     samples = db.get_gpu_samples_since(conn, instance["id"], cutoff)
     
     # Group samples by timestamp (handles multi-GPU)
@@ -89,22 +108,28 @@ def check_and_terminate_idle(conn, instance: dict, dry_run: bool = False) -> boo
     # Need at least some time points to make a decision (80% coverage)
     min_samples = int(IDLE_SHUTDOWN_HOURS * 60 * 0.8)
     if len(grouped) < min_samples:
-        log(f"  {instance['hostname'] or instance['id'][:8]}: Not enough samples ({len(grouped)}/{min_samples})")
+        log(f"  {name}: Not enough samples ({len(grouped)}/{min_samples}) - skipping")
         return False
     
     # Check if all time points have all GPUs at 0%
     all_idle = all(s["all_zero"] for s in grouped)
     
     if not all_idle:
+        # Find first non-zero sample to calculate how long truly idle
+        non_zero_times = [s["timestamp"] for s in grouped if not s["all_zero"]]
+        if non_zero_times:
+            last_activity = max(non_zero_times)
+            idle_hours = (now - last_activity) / 3600
+            remaining = IDLE_SHUTDOWN_HOURS - idle_hours
+            log(f"  {name}: Running {runtime_hours:.1f}h, idle {idle_hours:.1f}h (need {IDLE_SHUTDOWN_HOURS}h idle, {remaining:.1f}h to go)")
         return False
     
-    name = instance["hostname"] or instance["id"][:8]
-    
+    # Both conditions met - terminate
     if dry_run:
-        log(f"  {name}: WOULD TERMINATE (idle for {IDLE_SHUTDOWN_HOURS}+ hours)")
+        log(f"  {name}: WOULD TERMINATE (running {runtime_hours:.1f}h, idle {IDLE_SHUTDOWN_HOURS}+ hours)")
         return True
     
-    log(f"  {name}: Terminating (idle for {IDLE_SHUTDOWN_HOURS}+ hours)...")
+    log(f"  {name}: Terminating (running {runtime_hours:.1f}h, idle {IDLE_SHUTDOWN_HOURS}+ hours)...")
     try:
         terminated = lambda_api.terminate_instance([instance["id"]])
         if terminated:
@@ -127,7 +152,7 @@ def main():
     if args.dry_run:
         log("DRY RUN - no instances will be terminated")
     
-    log(f"Checking for idle instances (threshold: {IDLE_SHUTDOWN_HOURS} hours at 0% GPU)...")
+    log(f"Checking for idle instances (min runtime: {MIN_RUNTIME_HOURS}h, idle threshold: {IDLE_SHUTDOWN_HOURS}h)...")
     
     conn = db.get_db()
     

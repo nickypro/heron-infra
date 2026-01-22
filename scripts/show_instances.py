@@ -27,6 +27,7 @@ def load_config():
 
 
 CONFIG = load_config()
+MIN_RUNTIME_HOURS = float(CONFIG.get("MIN_RUNTIME_HOURS", "4"))
 IDLE_SHUTDOWN_HOURS = float(CONFIG.get("IDLE_SHUTDOWN_HOURS", "2"))
 
 
@@ -96,18 +97,25 @@ def get_instance_stats(conn, instance: dict) -> dict:
     """Get GPU usage stats for an instance (handles multi-GPU)."""
     instance_id = instance["id"]
     gpu_count = instance.get("gpu_count", 1)
+    now = time.time()
     
     # Get samples from last 24 hours
-    cutoff_24h = time.time() - (24 * 3600)
+    cutoff_24h = now - (24 * 3600)
     samples_24h = db.get_gpu_samples_since(conn, instance_id, cutoff_24h)
     
     # Get samples from idle window
-    cutoff_idle = time.time() - (IDLE_SHUTDOWN_HOURS * 3600)
+    cutoff_idle = now - (IDLE_SHUTDOWN_HOURS * 3600)
     samples_idle_window = db.get_gpu_samples_since(conn, instance_id, cutoff_idle)
     
     # Group samples by timestamp (averaging across GPUs)
     grouped_24h = group_samples_by_timestamp(samples_24h)
     grouped_idle = group_samples_by_timestamp(samples_idle_window)
+    
+    # Calculate runtime
+    first_seen = instance.get("first_seen")
+    runtime_hours = (now - first_seen) / 3600 if first_seen else 0
+    time_until_min_runtime = max(0, MIN_RUNTIME_HOURS - runtime_hours)
+    runtime_met = runtime_hours >= MIN_RUNTIME_HOURS
     
     stats = {
         "samples_24h": len(grouped_24h),  # Count of time points, not individual GPU samples
@@ -115,8 +123,12 @@ def get_instance_stats(conn, instance: dict) -> dict:
         "gpu_count": gpu_count,
         "current_gpu": None,
         "avg_gpu_1h": None,
+        "runtime_hours": runtime_hours,
+        "time_until_min_runtime": time_until_min_runtime,
+        "runtime_met": runtime_met,
         "idle_duration_hours": None,
-        "time_until_termination_hours": None,
+        "time_until_idle_threshold": None,
+        "idle_met": False,
         "will_terminate": False,
         "is_active": False,
     }
@@ -132,7 +144,7 @@ def get_instance_stats(conn, instance: dict) -> dict:
     stats["is_active"] = stats["current_gpu"] > 0
     
     # Average GPU last hour
-    cutoff_1h = time.time() - 3600
+    cutoff_1h = now - 3600
     samples_1h = [s for s in grouped_24h if s["timestamp"] > cutoff_1h]
     if samples_1h:
         stats["avg_gpu_1h"] = sum(s["avg_utilization"] for s in samples_1h) / len(samples_1h)
@@ -146,15 +158,17 @@ def get_instance_stats(conn, instance: dict) -> dict:
             break
     
     if idle_start is not None:
-        stats["idle_duration_hours"] = (time.time() - idle_start) / 3600
-        time_until = IDLE_SHUTDOWN_HOURS - stats["idle_duration_hours"]
-        stats["time_until_termination_hours"] = max(0, time_until)
+        stats["idle_duration_hours"] = (now - idle_start) / 3600
+        stats["time_until_idle_threshold"] = max(0, IDLE_SHUTDOWN_HOURS - stats["idle_duration_hours"])
         
-        # Check if will be terminated (all time points in window have all GPUs at 0%)
+        # Check if idle condition is met (all time points in window have all GPUs at 0%)
         min_samples = int(IDLE_SHUTDOWN_HOURS * 60 * 0.8)
         if len(grouped_idle) >= min_samples:
             all_idle = all(s["all_zero"] for s in grouped_idle)
-            stats["will_terminate"] = all_idle
+            stats["idle_met"] = all_idle
+        
+        # Will terminate only if BOTH conditions are met
+        stats["will_terminate"] = stats["runtime_met"] and stats["idle_met"]
     
     return stats
 
@@ -172,6 +186,9 @@ def get_status_indicator(stats: dict) -> str:
     """Get status emoji and text."""
     if stats["will_terminate"]:
         return "🔴 TERMINATE"
+    elif stats["idle_met"] and not stats["runtime_met"]:
+        # Idle long enough but runtime protection still active
+        return "🟠 PROTECTED"
     elif stats["idle_duration_hours"] is not None and stats["idle_duration_hours"] > IDLE_SHUTDOWN_HOURS * 0.5:
         return "🟡 IDLE-WARN"
     elif stats["current_gpu"] is not None and stats["current_gpu"] > 0:
@@ -204,28 +221,46 @@ def print_instance_status(instance: dict, stats: dict, cost_cents: int):
     gpu_now = f"{stats['current_gpu']:.0f}%" if stats['current_gpu'] is not None else "-"
     gpu_1h = f"{stats['avg_gpu_1h']:.0f}%" if stats['avg_gpu_1h'] is not None else "-"
     
-    # Idle info
-    idle_str = format_duration(stats["idle_duration_hours"]) if stats["idle_duration_hours"] else "-"
+    # Runtime info (condition 1)
+    runtime_str = format_duration(stats["runtime_hours"])
+    runtime_check = "✓" if stats["runtime_met"] else f"({format_duration(stats['time_until_min_runtime'])} to go)"
+    
+    # Idle info (condition 2)
+    idle_str = format_duration(stats["idle_duration_hours"]) if stats["idle_duration_hours"] else "0m"
+    if stats["idle_met"]:
+        idle_check = "✓"
+    elif stats["idle_duration_hours"] and stats["idle_duration_hours"] > 0:
+        idle_check = f"({format_duration(stats.get('time_until_idle_threshold', IDLE_SHUTDOWN_HOURS))} to go)"
+    else:
+        idle_check = "(not idle)"
+    
+    # Termination status
     if stats["will_terminate"]:
-        term_str = "NOW!"
-    elif stats["time_until_termination_hours"] is not None and stats["idle_duration_hours"]:
-        term_str = format_duration(stats["time_until_termination_hours"])
+        term_str = "🔴 NOW!"
+    elif stats["idle_met"] and not stats["runtime_met"]:
+        term_str = f"⏳ protected for {format_duration(stats['time_until_min_runtime'])}"
+    elif stats["idle_duration_hours"] and stats["idle_duration_hours"] > 0:
+        term_str = f"idle {idle_check}"
     else:
         term_str = "-"
     
     status = get_status_indicator(stats)
     cost = format_cost(cost_cents)
     
-    W = 68  # inner width
+    W = 72  # inner width
     print(f"┌─ {name} {'─' * (W - len(name) - 2)}┐")
     line1 = f"  {status:<12}  IP: {ip:<15}  Type: {itype}"
     print(f"│{line1:<{W}}│")
-    line2 = f"  Key: {ssh_key:<18}  Cost: {cost:<7}  Samples: {stats['samples_24h']} (24h)"
+    line2 = f"  Key: {ssh_key:<18}  Cost: {cost:<8}  Samples: {stats['samples_24h']} (24h)"
     print(f"│{line2:<{W}}│")
-    line3 = f"  {gpu_label}: {gpu_now:<4} now  {gpu_1h:<4} 1h avg   Idle: {idle_str:<6}  Term: {term_str}"
+    line3 = f"  {gpu_label}: {gpu_now:<4} now, {gpu_1h:<4} 1h avg"
     print(f"│{line3:<{W}}│")
-    line4 = f"  First: {first_seen}   Last: {last_seen}"
+    line4 = f"  Runtime: {runtime_str:<6} (min {MIN_RUNTIME_HOURS}h) {runtime_check}"
     print(f"│{line4:<{W}}│")
+    line5 = f"  Idle:    {idle_str:<6} (max {IDLE_SHUTDOWN_HOURS}h) {idle_check}"
+    print(f"│{line5:<{W}}│")
+    line6 = f"  First: {first_seen}   Last: {last_seen}"
+    print(f"│{line6:<{W}}│")
     print(f"└{'─' * W}┘")
 
 
@@ -283,14 +318,17 @@ def main():
                     "cost_cents": r["cost_cents"],
                     "current_gpu_pct": stats["current_gpu"],
                     "avg_gpu_1h_pct": stats["avg_gpu_1h"],
+                    "runtime_hours": stats["runtime_hours"],
+                    "runtime_met": stats["runtime_met"],
                     "idle_hours": stats["idle_duration_hours"],
-                    "hours_until_termination": stats["time_until_termination_hours"],
+                    "idle_met": stats["idle_met"],
                     "will_terminate": stats["will_terminate"],
                 })
             print(json.dumps(output, indent=2))
         else:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n  Lambda Instance Status  │  {now}  │  Idle threshold: {IDLE_SHUTDOWN_HOURS}h")
+            print(f"\n  Lambda Instance Status  │  {now}")
+            print(f"  Termination: ≥{MIN_RUNTIME_HOURS}h runtime AND ≥{IDLE_SHUTDOWN_HOURS}h idle")
             print(f"  {len(active)} active instance(s)\n")
             
             for r in results:

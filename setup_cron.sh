@@ -64,6 +64,9 @@ MANAGED_BLOCK="$MARKER_START
 # Terminate: shut down instances idle for too long
 */5 * * * * cd $SCRIPT_DIR/scripts && $PYTHON terminate_idle_instances.py >> $SCRIPT_DIR/logs/terminate.log 2>&1
 #
+# Availability: track instance type availability by region
+*/10 * * * * cd $SCRIPT_DIR/scripts && $PYTHON check_availability.py --record >> $SCRIPT_DIR/logs/availability.log 2>&1
+#
 # Backup: rsync instance home directories
 */30 * * * * cd $SCRIPT_DIR/scripts && $PYTHON backup.py >> $SCRIPT_DIR/logs/backup.log 2>&1
 $MARKER_END"
@@ -83,13 +86,15 @@ echo "$NEW_CRON" | crontab -
 echo "Cron jobs installed successfully!"
 echo ""
 echo "Scheduled jobs:"
-echo "  - Monitor:   every minute      (GPU stats, SSH config, costs)"
-echo "  - Terminate: every 5 minutes   (idle instance shutdown)"
-echo "  - Backup:    every 30 minutes  (rsync home directories)"
+echo "  - Monitor:      every minute      (GPU stats, SSH config, costs)"
+echo "  - Terminate:    every 5 minutes   (idle instance shutdown)"
+echo "  - Availability: every 10 minutes  (track instance availability)"
+echo "  - Backup:       every 30 minutes  (rsync home directories)"
 echo ""
 echo "Logs:"
 echo "  - $SCRIPT_DIR/logs/monitor.log"
 echo "  - $SCRIPT_DIR/logs/terminate.log"
+echo "  - $SCRIPT_DIR/logs/availability.log"
 echo "  - $SCRIPT_DIR/logs/backup.log"
 echo ""
 echo "Commands:"

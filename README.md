@@ -38,7 +38,7 @@ Install cron jobs:
 - `monitor.py` - collects GPU stats, updates `~/.ssh/config`, tracks costs (every minute)
 - `terminate_idle_instances.py` - shuts down instances at 0% GPU for too long (every 5 min)
 - `monitor_availability.py` - tracks instance type availability by region (every 10 min)
-- `backup.py` - rsyncs home directories to `./backup/` (every 30 min)
+- `backup.py` - rsyncs home dirs to `./backup/instances/`, volumes to `./backup/volumes/{region}/` (every 30 min)
 - `show_instances.py` - shows current instance status (manual)
 - `show_usage.py` - shows cost per SSH key by time period (manual)
 

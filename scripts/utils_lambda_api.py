@@ -125,6 +125,17 @@ def list_instance_types() -> list[dict]:
     return result.get("data", {})
 
 
+def list_filesystems() -> list[dict]:
+    """
+    Get all filesystems.
+    
+    Returns list of dicts with keys:
+        - id, name, mount_point, region, is_in_use, bytes_used
+    """
+    result = _request("GET", "/file-systems")
+    return result.get("data", [])
+
+
 if __name__ == "__main__":
     # Test API connection
     print("Testing Lambda Labs API connection...")

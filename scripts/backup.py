@@ -119,13 +119,15 @@ def backup_instance(instance: dict) -> bool:
     
     log(f"Backing up {name} ({ip}) to {dest_dir} using key {key_path.name}...")
     
-    # Build rsync command
+    # Build rsync command as a proper list (no shell=True needed)
     rsync_cmd = [
         "rsync",
         "-avz",
         "--delete",
         "--timeout=300",
         f"--max-size={BACKUP_MAX_FILE_SIZE_MB}M",
+        # SSH options passed via -e (quote key path for spaces)
+        "-e", f'ssh -F /dev/null -i "{key_path}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30',
     ]
     
     # Add exclude patterns
@@ -153,26 +155,13 @@ def backup_instance(instance: dict) -> bool:
     for excl in exclusions:
         rsync_cmd.extend(["--exclude", excl])
     
-    # SSH options for rsync
-    ssh_opts = (
-        f"-e 'ssh -i {key_path} "
-        f"-o StrictHostKeyChecking=no "
-        f"-o UserKnownHostsFile=/dev/null "
-        f"-o ConnectTimeout=30'"
-    )
-    rsync_cmd.append(ssh_opts)
-    
     # Source and destination
     rsync_cmd.append(f"{SSH_USER}@{ip}:~/")
     rsync_cmd.append(str(dest_dir) + "/")
     
-    # rsync needs shell=True because of the ssh options quoting
-    cmd_str = " ".join(rsync_cmd)
-    
     try:
         result = subprocess.run(
-            cmd_str,
-            shell=True,
+            rsync_cmd,
             capture_output=True,
             text=True,
             timeout=1800  # 30 minute timeout

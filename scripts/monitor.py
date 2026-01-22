@@ -101,6 +101,7 @@ def ssh_command(ip: str, command: str, key_path: Path, timeout: int = 30) -> tup
     Returns (exit_code, output).
     """
     ssh_opts = [
+        "-F", "/dev/null",  # Ignore SSH config to avoid path issues
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=10",
@@ -168,6 +169,7 @@ def initialize_machine(instance: dict) -> bool:
     
     # Copy init script to remote
     scp_opts = [
+        "-F", "/dev/null",  # Ignore SSH config to avoid path issues
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-i", str(key_path),
@@ -193,37 +195,6 @@ def initialize_machine(instance: dict) -> bool:
     
     log(f"Successfully initialized {instance['name']}")
     return True
-
-
-def check_idle_shutdown(conn, instance: dict) -> bool:
-    """
-    Check if instance should be shut down due to idle GPU.
-    Returns True if instance was terminated.
-    """
-    cutoff = time.time() - (IDLE_SHUTDOWN_HOURS * 3600)
-    samples = db.get_gpu_samples_since(conn, instance["id"], cutoff)
-    
-    # Need at least some samples to make a decision
-    min_samples = int(IDLE_SHUTDOWN_HOURS * 60 * 0.8)  # 80% of expected samples
-    if len(samples) < min_samples:
-        return False
-    
-    # Check if all samples are 0%
-    all_idle = all(s["utilization"] == 0 for s in samples)
-    
-    if all_idle:
-        log(f"Instance {instance['name']} ({instance['id']}) has been idle for {IDLE_SHUTDOWN_HOURS}+ hours, terminating...")
-        try:
-            terminated = lambda_api.terminate_instance([instance["id"]])
-            if terminated:
-                log(f"Successfully terminated {instance['name']}")
-                return True
-            else:
-                log(f"Failed to terminate {instance['name']}")
-        except Exception as e:
-            log(f"Error terminating {instance['name']}: {e}")
-    
-    return False
 
 
 def update_ssh_config(instances: list[dict]):
@@ -262,7 +233,7 @@ def update_ssh_config(instances: list[dict]):
         lambda_section += f"Host {host_name}\n"
         lambda_section += f"    HostName {inst['ip']}\n"
         lambda_section += f"    User {SSH_USER}\n"
-        lambda_section += f"    IdentityFile {key_path}\n"
+        lambda_section += f'    IdentityFile "{key_path}"\n'
         lambda_section += f"    StrictHostKeyChecking no\n"
         lambda_section += f"    UserKnownHostsFile /dev/null\n"
         lambda_section += f"    # Instance ID: {inst['id']}\n"
@@ -342,20 +313,16 @@ def main():
             if gpu_utils:
                 log(f"{inst['name']}: GPU utilization = {gpu_utils}")
         
-        # 5. Check for idle instances to terminate
-        for inst in active:
-            check_idle_shutdown(conn, inst)
-        
-        # 6. Update costs
+        # 5. Update costs
         update_costs(conn, active)
         
-        # 7. Update SSH config
+        # 6. Update SSH config
         update_ssh_config(active)
         
-        # 8. Export to JSON for inspection
+        # 7. Export to JSON for inspection
         db.export_to_json(conn)
         
-        # 9. Cleanup old samples (keep 24 hours)
+        # 8. Cleanup old samples (keep 24 hours)
         db.cleanup_old_samples(conn, older_than_hours=24)
         
         log("Monitor run complete")

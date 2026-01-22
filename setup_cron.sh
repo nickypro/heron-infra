@@ -11,6 +11,7 @@ mkdir -p "$SCRIPT_DIR/logs"
 
 # Cron job definitions (scripts are in ./scripts/)
 MONITOR_CRON="* * * * * cd $SCRIPT_DIR/scripts && $PYTHON monitor.py >> $SCRIPT_DIR/logs/monitor.log 2>&1"
+TERMINATE_CRON="*/5 * * * * cd $SCRIPT_DIR/scripts && $PYTHON terminate_idle_instances.py >> $SCRIPT_DIR/logs/terminate.log 2>&1"
 BACKUP_CRON="*/30 * * * * cd $SCRIPT_DIR/scripts && $PYTHON backup.py >> $SCRIPT_DIR/logs/backup.log 2>&1"
 
 # Marker for our cron jobs
@@ -52,6 +53,8 @@ CLEANED_CRON=$(echo "$CURRENT_CRON" | grep -v "$MARKER" || true)
 NEW_CRON="$CLEANED_CRON
 $MARKER - monitor (every minute)
 $MONITOR_CRON
+$MARKER - terminate idle (every 5 minutes)
+$TERMINATE_CRON
 $MARKER - backup (every 30 minutes)
 $BACKUP_CRON"
 
@@ -61,11 +64,13 @@ echo "$NEW_CRON" | crontab -
 echo "Cron jobs installed successfully!"
 echo ""
 echo "Scheduled jobs:"
-echo "  - Monitor: every minute"
-echo "  - Backup:  every 30 minutes"
+echo "  - Monitor:   every minute"
+echo "  - Terminate: every 5 minutes"
+echo "  - Backup:    every 30 minutes"
 echo ""
 echo "Logs will be written to:"
 echo "  - $SCRIPT_DIR/logs/monitor.log"
+echo "  - $SCRIPT_DIR/logs/terminate.log"
 echo "  - $SCRIPT_DIR/logs/backup.log"
 echo ""
 echo "To view current cron jobs:"

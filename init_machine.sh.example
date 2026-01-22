@@ -1,0 +1,23 @@
+#!/bin/bash
+# Example init script for new Lambda machines
+# Copy this to init_machine.sh and customize as needed
+
+set -e
+
+echo "Initializing machine..."
+
+# Update package lists
+sudo apt-get update
+
+# Install useful tools
+sudo apt-get install -y htop tmux vim curl wget git
+
+# Optional: Install additional Python packages
+# pip install --upgrade pip
+# pip install wandb tensorboard
+
+# Optional: Setup any custom configuration
+# mkdir -p ~/projects
+# git clone https://github.com/your-org/your-repo.git ~/projects/your-repo
+
+echo "Initialization complete!"

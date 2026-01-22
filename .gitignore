@@ -1,0 +1,25 @@
+# Config with secrets
+config.env
+
+# Data directory (except examples)
+data/state.db
+data/*.json
+
+# Backups
+backup/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

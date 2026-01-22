@@ -23,3 +23,5 @@ venv/
 .vscode/
 *.swp
 *.swo
+
+lambda-api-spec*.json

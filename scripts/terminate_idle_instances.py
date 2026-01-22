@@ -75,16 +75,30 @@ def group_samples_by_timestamp(samples: list[dict], tolerance: float = 30.0) -> 
     return grouped
 
 
+def is_whitelisted(instance: dict) -> bool:
+    """Check if instance is whitelisted (has 'whitelist' in custom name, case-insensitive)."""
+    # Check the user-set custom name (not the auto-generated hostname)
+    custom_name = instance.get("name") or ""
+    return "whitelist" in custom_name.lower()
+
+
 def check_and_terminate_idle(conn, instance: dict, dry_run: bool = False) -> bool:
     """
     Check if instance should be terminated. Both conditions must be met:
     1. Running for at least MIN_RUNTIME_HOURS
     2. Idle (all GPUs at 0%) for at least IDLE_SHUTDOWN_HOURS
     
+    Instances with 'whitelist' in their name are never terminated.
+    
     Returns True if instance was (or would be) terminated.
     """
     name = instance["hostname"] or instance["id"][:8]
     now = time.time()
+    
+    # Check whitelist
+    if is_whitelisted(instance):
+        log(f"  {name}: Whitelisted - skipping")
+        return False
     
     # Condition 1: Check minimum runtime
     first_seen = instance.get("first_seen")

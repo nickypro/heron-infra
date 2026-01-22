@@ -182,9 +182,18 @@ def get_cost_for_key(conn, ssh_key: str) -> int:
     return 0
 
 
-def get_status_indicator(stats: dict) -> str:
+def is_whitelisted(instance: dict) -> bool:
+    """Check if instance is whitelisted (has 'whitelist' in custom name, case-insensitive)."""
+    # Check the user-set custom name (not the auto-generated hostname)
+    custom_name = instance.get("name") or ""
+    return "whitelist" in custom_name.lower()
+
+
+def get_status_indicator(stats: dict, instance: dict) -> str:
     """Get status emoji and text."""
-    if stats["will_terminate"]:
+    if is_whitelisted(instance):
+        return "🔒 WHITELIST"
+    elif stats["will_terminate"]:
         return "🔴 TERMINATE"
     elif stats["idle_met"] and not stats["runtime_met"]:
         # Idle long enough but runtime protection still active
@@ -201,7 +210,8 @@ def get_status_indicator(stats: dict) -> str:
 
 def print_instance_status(instance: dict, stats: dict, cost_cents: int):
     """Print compact formatted status for an instance."""
-    name = instance.get("hostname") or instance.get("name") or f"lambda-{instance['id'][:8]}"
+    hostname = instance.get("hostname") or f"lambda-{instance['id'][:8]}"
+    custom_name = instance.get("name")  # User-set name on Lambda Labs
     ip = instance.get("ip", "-")
     itype = instance.get("instance_type", "?")
     
@@ -235,7 +245,10 @@ def print_instance_status(instance: dict, stats: dict, cost_cents: int):
         idle_check = "(not idle)"
     
     # Termination status
-    if stats["will_terminate"]:
+    whitelisted = is_whitelisted(instance)
+    if whitelisted:
+        term_str = "🔒 never"
+    elif stats["will_terminate"]:
         term_str = "🔴 NOW!"
     elif stats["idle_met"] and not stats["runtime_met"]:
         term_str = f"⏳ protected for {format_duration(stats['time_until_min_runtime'])}"
@@ -244,12 +257,21 @@ def print_instance_status(instance: dict, stats: dict, cost_cents: int):
     else:
         term_str = "-"
     
-    status = get_status_indicator(stats)
+    status = get_status_indicator(stats, instance)
     cost = format_cost(cost_cents)
     
     W = 72  # inner width
-    print(f"┌─ {name} {'─' * (W - len(name) - 2)}┐")
-    line1 = f"  {status:<12}  IP: {ip:<15}  Type: {itype}"
+    # Use custom name as title if set, otherwise hostname
+    title = custom_name if custom_name else hostname
+    print(f"┌─ {title} {'─' * (W - len(title) - 2)}┐")
+    
+    # Show hostname on first line if we used custom name as title
+    if custom_name:
+        line0 = f"  {status:<12}  Host: {hostname}"
+        print(f"│{line0:<{W}}│")
+        line1 = f"  IP: {ip:<15}  Type: {itype}"
+    else:
+        line1 = f"  {status:<12}  IP: {ip:<15}  Type: {itype}"
     print(f"│{line1:<{W}}│")
     line2 = f"  Key: {ssh_key:<18}  Cost: {cost:<8}  Samples: {stats['samples_24h']} (24h)"
     print(f"│{line2:<{W}}│")
@@ -309,10 +331,12 @@ def main():
                     ssh_keys = json.loads(ssh_keys)
                 output.append({
                     "id": inst["id"],
-                    "name": inst.get("hostname") or inst.get("name"),
+                    "hostname": inst.get("hostname"),
+                    "custom_name": inst.get("name"),
                     "ip": inst.get("ip"),
                     "instance_type": inst.get("instance_type"),
                     "ssh_key": ssh_keys[0] if ssh_keys else None,
+                    "whitelisted": is_whitelisted(inst),
                     "first_seen": inst.get("first_seen"),
                     "last_seen": inst.get("last_seen"),
                     "cost_cents": r["cost_cents"],

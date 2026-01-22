@@ -58,6 +58,19 @@ def _init_schema(conn: sqlite3.Connection):
             total_cents INTEGER DEFAULT 0,
             last_updated REAL
         );
+
+        CREATE TABLE IF NOT EXISTS availability (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_type TEXT NOT NULL,
+            region TEXT NOT NULL,
+            timestamp REAL NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_availability_type_time 
+            ON availability(instance_type, timestamp);
+        
+        CREATE INDEX IF NOT EXISTS idx_availability_time 
+            ON availability(timestamp);
     """)
     conn.commit()
 
@@ -172,6 +185,36 @@ def cleanup_old_samples(conn: sqlite3.Connection, older_than_hours: int = 24):
     """Remove GPU samples older than specified hours."""
     cutoff = time.time() - (older_than_hours * 3600)
     conn.execute("DELETE FROM gpu_samples WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+
+
+def record_availability(conn: sqlite3.Connection, instance_type: str, regions: list[str]):
+    """Record which regions have capacity for an instance type right now."""
+    now = time.time()
+    for region in regions:
+        conn.execute(
+            "INSERT INTO availability (instance_type, region, timestamp) VALUES (?, ?, ?)",
+            (instance_type, region, now)
+        )
+    conn.commit()
+
+
+def get_availability_history(conn: sqlite3.Connection, hours: int = 24) -> list[dict]:
+    """Get availability records from the last N hours."""
+    cutoff = time.time() - (hours * 3600)
+    rows = conn.execute("""
+        SELECT instance_type, region, timestamp 
+        FROM availability 
+        WHERE timestamp > ?
+        ORDER BY timestamp DESC
+    """, (cutoff,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def cleanup_old_availability(conn: sqlite3.Connection, older_than_hours: int = 168):
+    """Remove availability records older than specified hours (default 1 week)."""
+    cutoff = time.time() - (older_than_hours * 3600)
+    conn.execute("DELETE FROM availability WHERE timestamp < ?", (cutoff,))
     conn.commit()
 
 

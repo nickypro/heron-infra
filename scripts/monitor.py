@@ -15,9 +15,12 @@ from pathlib import Path
 import db
 import lambda_api
 
+PROJECT_DIR = Path(__file__).parent.parent
+
+
 # Load config
 def load_config():
-    config_path = Path(__file__).parent / "config.env"
+    config_path = PROJECT_DIR / "config.env"
     config = {}
     if config_path.exists():
         with open(config_path) as f:
@@ -33,7 +36,12 @@ CONFIG = load_config()
 IDLE_SHUTDOWN_HOURS = float(CONFIG.get("IDLE_SHUTDOWN_HOURS", "2"))
 SSH_CONFIG_PATH = Path(CONFIG.get("SSH_CONFIG_PATH", "~/.ssh/config")).expanduser()
 SSH_USER = CONFIG.get("SSH_USER", "ubuntu")
-SSH_KEY_PATH = Path(CONFIG.get("SSH_KEY_PATH", "~/.ssh/id_rsa")).expanduser()
+SSH_KEYS_DIR = Path(CONFIG.get("SSH_KEYS_DIR", "./keys"))
+if not SSH_KEYS_DIR.is_absolute():
+    SSH_KEYS_DIR = PROJECT_DIR / SSH_KEYS_DIR
+SSH_KEYS_DIR = SSH_KEYS_DIR.expanduser()
+
+SSH_KEY_DEFAULT = Path(CONFIG.get("SSH_KEY_DEFAULT", "~/.ssh/id_rsa")).expanduser()
 INIT_SCRIPT_PATH = CONFIG.get("INIT_SCRIPT_PATH", "")
 
 
@@ -43,7 +51,51 @@ def log(msg: str):
     print(f"[{ts}] {msg}")
 
 
-def ssh_command(ip: str, command: str, timeout: int = 30) -> tuple[int, str]:
+def get_ssh_key_for_instance(instance: dict) -> Path:
+    """
+    Find the appropriate SSH key for an instance.
+    Looks in SSH_KEYS_DIR for a key matching one of the instance's ssh_key_names.
+    
+    Supports two structures:
+        ./keys/chen-sabotage              (direct file)
+        ./keys/chen-sabotage/chen-sabotage.pem  (subfolder with .pem)
+    
+    Falls back to SSH_KEY_DEFAULT if not found.
+    """
+    ssh_key_names = instance.get("ssh_key_names", [])
+    if isinstance(ssh_key_names, str):
+        ssh_key_names = json.loads(ssh_key_names)
+    
+    # Try to find a matching key in the keys directory
+    if SSH_KEYS_DIR.exists():
+        for key_name in ssh_key_names:
+            # Structure 1: Direct file (./keys/chen-sabotage)
+            key_path = SSH_KEYS_DIR / key_name
+            if key_path.is_file():
+                return key_path
+            
+            # Structure 1 with extensions
+            for ext in [".pem", ".key"]:
+                key_path = SSH_KEYS_DIR / f"{key_name}{ext}"
+                if key_path.is_file():
+                    return key_path
+            
+            # Structure 2: Subfolder (./keys/chen-sabotage/chen-sabotage.pem)
+            key_dir = SSH_KEYS_DIR / key_name
+            if key_dir.is_dir():
+                for ext in [".pem", ".key", ""]:
+                    key_path = key_dir / f"{key_name}{ext}"
+                    if key_path.is_file():
+                        return key_path
+                # Also check for any .pem file in the subfolder
+                pem_files = list(key_dir.glob("*.pem"))
+                if pem_files:
+                    return pem_files[0]
+    
+    return SSH_KEY_DEFAULT
+
+
+def ssh_command(ip: str, command: str, key_path: Path, timeout: int = 30) -> tuple[int, str]:
     """
     Run a command on a remote machine via SSH.
     Returns (exit_code, output).
@@ -53,7 +105,7 @@ def ssh_command(ip: str, command: str, timeout: int = 30) -> tuple[int, str]:
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=10",
         "-o", "BatchMode=yes",
-        "-i", str(SSH_KEY_PATH),
+        "-i", str(key_path),
     ]
     
     cmd = ["ssh"] + ssh_opts + [f"{SSH_USER}@{ip}", command]
@@ -72,13 +124,18 @@ def ssh_command(ip: str, command: str, timeout: int = 30) -> tuple[int, str]:
         return -1, str(e)
 
 
-def get_gpu_utilization(ip: str) -> list[int]:
+def get_gpu_utilization(instance: dict) -> list[int]:
     """
     Get GPU utilization percentages from a machine.
     Returns list of utilization values (one per GPU), or empty list on failure.
     """
+    ip = instance.get("ip")
+    if not ip:
+        return []
+    
+    key_path = get_ssh_key_for_instance(instance)
     cmd = "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"
-    exit_code, output = ssh_command(ip, cmd)
+    exit_code, output = ssh_command(ip, cmd, key_path)
     
     if exit_code != 0:
         log(f"Failed to get GPU stats from {ip}: {output}")
@@ -98,18 +155,22 @@ def initialize_machine(instance: dict) -> bool:
         return True
     
     init_script = Path(INIT_SCRIPT_PATH)
+    if not init_script.is_absolute():
+        init_script = PROJECT_DIR / init_script
+    
     if not init_script.exists():
         log(f"Init script not found: {init_script}")
         return False
     
     ip = instance["ip"]
-    log(f"Initializing machine {instance['name']} ({ip})...")
+    key_path = get_ssh_key_for_instance(instance)
+    log(f"Initializing machine {instance['name']} ({ip}) with key {key_path.name}...")
     
     # Copy init script to remote
     scp_opts = [
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
-        "-i", str(SSH_KEY_PATH),
+        "-i", str(key_path),
     ]
     
     scp_cmd = ["scp"] + scp_opts + [str(init_script), f"{SSH_USER}@{ip}:/tmp/init_machine.sh"]
@@ -124,7 +185,7 @@ def initialize_machine(instance: dict) -> bool:
         return False
     
     # Run init script
-    exit_code, output = ssh_command(ip, "chmod +x /tmp/init_machine.sh && /tmp/init_machine.sh", timeout=300)
+    exit_code, output = ssh_command(ip, "chmod +x /tmp/init_machine.sh && /tmp/init_machine.sh", key_path, timeout=300)
     
     if exit_code != 0:
         log(f"Init script failed on {ip}: {output}")
@@ -195,10 +256,13 @@ def update_ssh_config(instances: list[dict]):
         # Sanitize hostname for SSH config
         host_name = host_name.replace(" ", "-").lower()
         
+        # Get the right SSH key for this instance
+        key_path = get_ssh_key_for_instance(inst)
+        
         lambda_section += f"Host {host_name}\n"
         lambda_section += f"    HostName {inst['ip']}\n"
         lambda_section += f"    User {SSH_USER}\n"
-        lambda_section += f"    IdentityFile {SSH_KEY_PATH}\n"
+        lambda_section += f"    IdentityFile {key_path}\n"
         lambda_section += f"    StrictHostKeyChecking no\n"
         lambda_section += f"    UserKnownHostsFile /dev/null\n"
         lambda_section += f"    # Instance ID: {inst['id']}\n"
@@ -271,7 +335,7 @@ def main():
             if not inst.get("ip"):
                 continue
             
-            gpu_utils = get_gpu_utilization(inst["ip"])
+            gpu_utils = get_gpu_utilization(inst)
             for gpu_idx, util in enumerate(gpu_utils):
                 db.add_gpu_sample(conn, inst["id"], util, gpu_idx)
             

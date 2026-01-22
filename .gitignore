@@ -1,6 +1,10 @@
 # Config with secrets
 config.env
 
+# SSH keys (secrets) - keep .gitkeep for structure
+keys/*
+!keys/.gitkeep
+
 # Data directory (except examples)
 data/state.db
 data/*.json

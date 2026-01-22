@@ -10,7 +10,7 @@ import requests
 # Load config
 def _load_config():
     """Load configuration from config.env file."""
-    config_path = Path(__file__).parent / "config.env"
+    config_path = Path(__file__).parent.parent / "config.env"
     config = {}
     if config_path.exists():
         with open(config_path) as f:

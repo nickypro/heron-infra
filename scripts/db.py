@@ -7,7 +7,8 @@ import sqlite3
 import time
 from pathlib import Path
 
-DATA_DIR = Path(__file__).parent / "data"
+PROJECT_DIR = Path(__file__).parent.parent
+DATA_DIR = PROJECT_DIR / "data"
 DB_PATH = DATA_DIR / "state.db"
 
 

@@ -4,6 +4,7 @@ Backup Lambda instances to local storage.
 Run via cron every 30 minutes.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -12,9 +13,12 @@ from pathlib import Path
 
 import db
 
+PROJECT_DIR = Path(__file__).parent.parent
+
+
 # Load config
 def load_config():
-    config_path = Path(__file__).parent / "config.env"
+    config_path = PROJECT_DIR / "config.env"
     config = {}
     if config_path.exists():
         with open(config_path) as f:
@@ -27,17 +31,70 @@ def load_config():
 
 
 CONFIG = load_config()
-BACKUP_DIR = Path(CONFIG.get("BACKUP_DIR", "./backup")).expanduser()
+BACKUP_DIR = Path(CONFIG.get("BACKUP_DIR", "./backup"))
+if not BACKUP_DIR.is_absolute():
+    BACKUP_DIR = PROJECT_DIR / BACKUP_DIR
+BACKUP_DIR = BACKUP_DIR.expanduser()
+
 BACKUP_EXCLUDE_PATTERNS = CONFIG.get("BACKUP_EXCLUDE_PATTERNS", ".*,wandb,*.pyc,__pycache__")
 BACKUP_MAX_FILE_SIZE_MB = int(CONFIG.get("BACKUP_MAX_FILE_SIZE_MB", "100"))
 SSH_USER = CONFIG.get("SSH_USER", "ubuntu")
-SSH_KEY_PATH = Path(CONFIG.get("SSH_KEY_PATH", "~/.ssh/id_rsa")).expanduser()
+SSH_KEYS_DIR = Path(CONFIG.get("SSH_KEYS_DIR", "./keys"))
+if not SSH_KEYS_DIR.is_absolute():
+    SSH_KEYS_DIR = PROJECT_DIR / SSH_KEYS_DIR
+SSH_KEYS_DIR = SSH_KEYS_DIR.expanduser()
+
+SSH_KEY_DEFAULT = Path(CONFIG.get("SSH_KEY_DEFAULT", "~/.ssh/id_rsa")).expanduser()
 
 
 def log(msg: str):
     """Print timestamped log message."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}")
+
+
+def get_ssh_key_for_instance(instance: dict) -> Path:
+    """
+    Find the appropriate SSH key for an instance.
+    Looks in SSH_KEYS_DIR for a key matching one of the instance's ssh_key_names.
+    
+    Supports two structures:
+        ./keys/chen-sabotage              (direct file)
+        ./keys/chen-sabotage/chen-sabotage.pem  (subfolder with .pem)
+    
+    Falls back to SSH_KEY_DEFAULT if not found.
+    """
+    ssh_key_names = instance.get("ssh_key_names", [])
+    if isinstance(ssh_key_names, str):
+        ssh_key_names = json.loads(ssh_key_names)
+    
+    # Try to find a matching key in the keys directory
+    if SSH_KEYS_DIR.exists():
+        for key_name in ssh_key_names:
+            # Structure 1: Direct file (./keys/chen-sabotage)
+            key_path = SSH_KEYS_DIR / key_name
+            if key_path.is_file():
+                return key_path
+            
+            # Structure 1 with extensions
+            for ext in [".pem", ".key"]:
+                key_path = SSH_KEYS_DIR / f"{key_name}{ext}"
+                if key_path.is_file():
+                    return key_path
+            
+            # Structure 2: Subfolder (./keys/chen-sabotage/chen-sabotage.pem)
+            key_dir = SSH_KEYS_DIR / key_name
+            if key_dir.is_dir():
+                for ext in [".pem", ".key", ""]:
+                    key_path = key_dir / f"{key_name}{ext}"
+                    if key_path.is_file():
+                        return key_path
+                # Also check for any .pem file in the subfolder
+                pem_files = list(key_dir.glob("*.pem"))
+                if pem_files:
+                    return pem_files[0]
+    
+    return SSH_KEY_DEFAULT
 
 
 def backup_instance(instance: dict) -> bool:
@@ -57,7 +114,10 @@ def backup_instance(instance: dict) -> bool:
     dest_dir = BACKUP_DIR / name
     dest_dir.mkdir(parents=True, exist_ok=True)
     
-    log(f"Backing up {name} ({ip}) to {dest_dir}...")
+    # Get the right SSH key for this instance
+    key_path = get_ssh_key_for_instance(instance)
+    
+    log(f"Backing up {name} ({ip}) to {dest_dir} using key {key_path.name}...")
     
     # Build rsync command
     rsync_cmd = [
@@ -95,7 +155,7 @@ def backup_instance(instance: dict) -> bool:
     
     # SSH options for rsync
     ssh_opts = (
-        f"-e 'ssh -i {SSH_KEY_PATH} "
+        f"-e 'ssh -i {key_path} "
         f"-o StrictHostKeyChecking=no "
         f"-o UserKnownHostsFile=/dev/null "
         f"-o ConnectTimeout=30'"

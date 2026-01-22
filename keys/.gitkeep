@@ -1,0 +1,24 @@
+# SSH keys directory
+# 
+# Place your Lambda SSH keys here, named to match the key names in Lambda.
+#
+# Supported structures:
+#   ./keys/chen-sabotage              (direct file)
+#   ./keys/chen-sabotage.pem          (with .pem extension)
+#   ./keys/chen-sabotage/chen-sabotage.pem  (subfolder)
+#
+# Expected keys based on your list:
+#   brass-linksec
+#   brass-owl
+#   buck-perms
+#   buck-crypto
+#   kang-tee
+#   kang-zk
+#   kulp-gpuleak
+#   warrshul-oss
+#   chen-sabotage
+#   nichols-envs
+#
+# Make sure permissions are correct:
+#   chmod 600 ./keys/*
+#   chmod 600 ./keys/*/*.pem

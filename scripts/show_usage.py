@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Check usage/cost per SSH key over different time periods.
+Check usage/cost per Lambda account over different time periods.
+Supports multiple Lambda Labs accounts.
 """
 
 import json
@@ -9,13 +10,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import yaml
-
+import utils_accounts
 import utils_db as db
 
 PROJECT_DIR = Path(__file__).parent.parent
-DATA_DIR = PROJECT_DIR / "data"
-BUDGETS_FILE = DATA_DIR / "budgets.yaml"
 
 
 def load_config():
@@ -36,24 +34,6 @@ CONFIG = load_config()
 DEFAULT_LIMIT = int(CONFIG.get("BUDGET_LIMIT_DEFAULT", "500000"))
 
 
-def load_budgets() -> dict:
-    """Load budgets.yaml if it exists."""
-    if BUDGETS_FILE.exists():
-        with open(BUDGETS_FILE) as f:
-            return yaml.safe_load(f) or {}
-    return {}
-
-
-def get_limit_for_key(data: dict, ssh_key: str) -> int:
-    """Get the effective limit for an SSH key (custom or default)."""
-    default_limit = data.get("defaults", {}).get("limit_cents", DEFAULT_LIMIT)
-    key_config = data.get("keys", {}).get(ssh_key, {})
-    limit = key_config.get("limit_cents", "default")
-    if limit == "default" or limit is None:
-        return default_limit
-    return int(limit)
-
-
 def format_cost(cents: float) -> str:
     """Format cents to dollar string."""
     return f"${cents / 100:.2f}"
@@ -70,10 +50,10 @@ def format_duration(hours: float) -> str:
         return f"{days:.1f}d"
 
 
-def get_usage_by_key(conn, since_timestamp: float) -> dict:
+def get_usage_by_account(conn, since_timestamp: float) -> dict:
     """
-    Calculate usage per SSH key since a given timestamp.
-    Returns dict of {ssh_key: {cost_cents, hours, instances}}.
+    Calculate usage per account since a given timestamp.
+    Returns dict of {account: {cost_cents, hours, instances}}.
     """
     # Get all GPU samples in the time range, grouped by instance
     samples = conn.execute("""
@@ -86,16 +66,13 @@ def get_usage_by_key(conn, since_timestamp: float) -> dict:
     if not samples:
         return {}
     
-    # Get instance info (hourly cost, ssh keys) - includes terminated instances
+    # Get instance info (hourly cost, account) - includes terminated instances
     instances = {}
     for row in conn.execute("SELECT * FROM instances").fetchall():
         inst = dict(row)
-        ssh_keys = inst.get("ssh_key_names", "[]")
-        if isinstance(ssh_keys, str):
-            ssh_keys = json.loads(ssh_keys)
         instances[inst["id"]] = {
             "hourly_cents": inst.get("hourly_cost_cents", 0),
-            "ssh_key": ssh_keys[0] if ssh_keys else "unknown",
+            "account": inst.get("account") or "default",
             "name": inst.get("hostname") or inst.get("name") or inst["id"][:8],
             "type": inst.get("instance_type", "unknown"),
             "status": inst.get("status", "unknown"),
@@ -106,43 +83,34 @@ def get_usage_by_key(conn, since_timestamp: float) -> dict:
     for sample in samples:
         instance_minutes[sample["instance_id"]] += 1
     
-    # Calculate cost per SSH key
-    usage_by_key = defaultdict(lambda: {"cost_cents": 0, "hours": 0, "instances": {}})
+    # Calculate cost per account
+    usage_by_account = defaultdict(lambda: {"cost_cents": 0, "hours": 0, "instances": {}})
     
     for instance_id, minutes in instance_minutes.items():
         if instance_id not in instances:
-            # Instance not in DB (shouldn't happen, but handle gracefully)
             continue
         
         inst = instances[instance_id]
-        ssh_key = inst["ssh_key"]
+        account = inst["account"]
         hours = minutes / 60
         cost_cents = (inst["hourly_cents"] * minutes) / 60
         
-        usage_by_key[ssh_key]["cost_cents"] += cost_cents
-        usage_by_key[ssh_key]["hours"] += hours
-        # Store instance with its hours and status
-        usage_by_key[ssh_key]["instances"][inst["name"]] = {
+        usage_by_account[account]["cost_cents"] += cost_cents
+        usage_by_account[account]["hours"] += hours
+        usage_by_account[account]["instances"][inst["name"]] = {
             "hours": hours,
             "status": inst["status"],
         }
     
-    # Convert instance dicts to lists for JSON serialization
-    for key in usage_by_key:
-        usage_by_key[key]["instances"] = dict(usage_by_key[key]["instances"])
+    for acct in usage_by_account:
+        usage_by_account[acct]["instances"] = dict(usage_by_account[acct]["instances"])
     
-    return dict(usage_by_key)
-
-
-def get_all_time_usage(conn) -> dict:
-    """Get all-time usage from the costs table."""
-    costs = db.get_all_costs(conn)
-    return {c["ssh_key"]: {"cost_cents": c["total_cents"], "last_updated": c["last_updated"]} for c in costs}
+    return dict(usage_by_account)
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Check usage per SSH key")
+    parser = argparse.ArgumentParser(description="Check usage per Lambda account")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     args = parser.parse_args()
     
@@ -151,77 +119,74 @@ def main():
     try:
         now = time.time()
         
+        # Load accounts config
+        accounts_data = utils_accounts.load_accounts()
+        accounts_list = utils_accounts.get_account_list(accounts_data)
+        account_budgets = {acc["name"]: acc for acc in accounts_list}
+        default_limit = accounts_data.get("defaults", {}).get("limit_cents", DEFAULT_LIMIT)
+        
         # Calculate usage for different time periods
         periods = {
-            "1h": now - 3600,
             "24h": now - 86400,
-            "7d": now - 7 * 86400,
         }
         
         usage_data = {}
         for period_name, since in periods.items():
-            usage_data[period_name] = get_usage_by_key(conn, since)
+            usage_data[period_name] = get_usage_by_account(conn, since)
         
-        # Get all-time totals
-        all_time = get_all_time_usage(conn)
+        # Get all-time totals from account_costs table
+        all_time = {c["account"]: {"cost_cents": c["total_cents"]} for c in db.get_all_account_costs(conn)}
         
-        # Get all SSH keys
-        all_keys = set()
-        for period_usage in usage_data.values():
-            all_keys.update(period_usage.keys())
-        all_keys.update(all_time.keys())
-        
-        # Load budget config
-        budget_data = load_budgets()
+        # Get all accounts (from config + from costs)
+        all_accounts = set(account_budgets.keys()) | set(all_time.keys())
         
         if args.json:
             output = {}
-            for key in sorted(all_keys):
-                limit = get_limit_for_key(budget_data, key)
-                total = all_time.get(key, {}).get("cost_cents", 0)
-                output[key] = {
-                    "1h": usage_data["1h"].get(key, {}).get("cost_cents", 0),
-                    "24h": usage_data["24h"].get(key, {}).get("cost_cents", 0),
-                    "7d": usage_data["7d"].get(key, {}).get("cost_cents", 0),
+            for acct in sorted(all_accounts):
+                acc_config = account_budgets.get(acct)
+                limit = acc_config["limit_cents"] if acc_config else default_limit
+                total = all_time.get(acct, {}).get("cost_cents", 0)
+                output[acct] = {
+                    "24h": usage_data["24h"].get(acct, {}).get("cost_cents", 0),
                     "total": total,
                     "limit": limit,
                     "remaining": limit - total,
                 }
             print(json.dumps(output, indent=2))
         else:
-            default_limit = budget_data.get("defaults", {}).get("limit_cents", DEFAULT_LIMIT)
-            print(f"\n  Usage by SSH Key  │  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"\n  Usage by Account  │  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"  Default budget: {format_cost(default_limit)}\n")
             
-            if not all_keys:
+            if not all_accounts:
                 print("  No usage data found.\n")
                 return
             
             # Header
-            print(f"  {'SSH Key':<20} │ {'24 Hours':>9} │ {'Total':>10} │ {'Limit':>10} │ {'Remaining':>10}")
+            print(f"  {'Account':<20} │ {'24 Hours':>9} │ {'Total':>10} │ {'Limit':>10} │ {'Remaining':>10}")
             print(f"  {'-'*20}-┼-{'-'*9}-┼-{'-'*10}-┼-{'-'*10}-┼-{'-'*10}")
             
             # Sort by total cost descending
-            sorted_keys = sorted(all_keys, key=lambda k: all_time.get(k, {}).get("cost_cents", 0), reverse=True)
+            sorted_accounts = sorted(all_accounts, key=lambda a: all_time.get(a, {}).get("cost_cents", 0), reverse=True)
             
             totals = {"24h": 0, "total": 0}
             
-            for key in sorted_keys:
-                cost_24h = usage_data["24h"].get(key, {}).get("cost_cents", 0)
-                cost_total = all_time.get(key, {}).get("cost_cents", 0)
-                limit = get_limit_for_key(budget_data, key)
+            for acct in sorted_accounts:
+                cost_24h = usage_data["24h"].get(acct, {}).get("cost_cents", 0)
+                cost_total = all_time.get(acct, {}).get("cost_cents", 0)
+                
+                acc_config = account_budgets.get(acct)
+                limit = acc_config["limit_cents"] if acc_config else default_limit
                 remaining = limit - cost_total
                 
                 totals["24h"] += cost_24h
                 totals["total"] += cost_total
                 
-                # Truncate long key names
-                display_key = key[:20] if len(key) <= 20 else key[:17] + "..."
+                # Truncate long names
+                display_name = acct[:20] if len(acct) <= 20 else acct[:17] + "..."
                 
-                # Show limit as "*" if using default
-                key_config = budget_data.get("keys", {}).get(key, {})
-                limit_val = key_config.get("limit_cents", "default")
-                limit_str = format_cost(limit) if limit_val != "default" and limit_val is not None else f"{format_cost(limit)}*"
+                # Show limit with indicator if using default
+                is_custom_limit = acc_config is not None
+                limit_str = format_cost(limit) if is_custom_limit else f"{format_cost(limit)}*"
                 
                 # Remaining with status
                 if remaining < 0:
@@ -231,7 +196,7 @@ def main():
                 else:
                     remaining_str = format_cost(remaining)
                 
-                print(f"  {display_key:<20} │ {format_cost(cost_24h):>9} │ {format_cost(cost_total):>10} │ {limit_str:>10} │ {remaining_str:>10}")
+                print(f"  {display_name:<20} │ {format_cost(cost_24h):>9} │ {format_cost(cost_total):>10} │ {limit_str:>10} │ {remaining_str:>10}")
             
             # Totals row
             print(f"  {'-'*20}-┼-{'-'*9}-┼-{'-'*10}-┼-{'-'*10}-┼-{'-'*10}")
@@ -243,11 +208,11 @@ def main():
             # Show hours breakdown for recent period
             if usage_data["24h"]:
                 print("  Hours by instance (24h):")
-                for key in sorted_keys:
-                    data = usage_data["24h"].get(key, {})
+                for acct in sorted_accounts:
+                    data = usage_data["24h"].get(acct, {})
                     instances = data.get("instances", {})
                     if instances:
-                        print(f"    {key}:")
+                        print(f"    {acct}:")
                         for inst_name, inst_data in sorted(instances.items(), key=lambda x: x[1]["hours"], reverse=True):
                             status = inst_data.get("status", "unknown")
                             status_icon = "●" if status == "active" else "○"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Check status of Lambda instances: GPU usage, idle time, time until termination.
+Supports multiple Lambda Labs accounts.
 """
 
 import json
@@ -8,13 +9,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import yaml
-
+import utils_accounts
 import utils_db as db
 
 PROJECT_DIR = Path(__file__).parent.parent
-DATA_DIR = PROJECT_DIR / "data"
-BUDGETS_FILE = DATA_DIR / "budgets.yaml"
 
 
 def load_config():
@@ -34,24 +32,6 @@ CONFIG = load_config()
 MIN_RUNTIME_HOURS = float(CONFIG.get("MIN_RUNTIME_HOURS", "4"))
 IDLE_SHUTDOWN_HOURS = float(CONFIG.get("IDLE_SHUTDOWN_HOURS", "2"))
 DEFAULT_BUDGET_LIMIT = int(CONFIG.get("BUDGET_LIMIT_DEFAULT", "500000"))
-
-
-def load_budgets() -> dict:
-    """Load budgets.yaml if it exists."""
-    if BUDGETS_FILE.exists():
-        with open(BUDGETS_FILE) as f:
-            return yaml.safe_load(f) or {}
-    return {}
-
-
-def get_budget_for_key(data: dict, ssh_key: str) -> tuple[int, int]:
-    """Get (limit_cents, spent_cents) for an SSH key."""
-    default_limit = data.get("defaults", {}).get("limit_cents", DEFAULT_BUDGET_LIMIT)
-    key_config = data.get("keys", {}).get(ssh_key, {})
-    limit = key_config.get("limit_cents", "default")
-    if limit == "default" or limit is None:
-        limit = default_limit
-    return int(limit)
 
 
 def format_duration(hours: float) -> str:
@@ -309,7 +289,9 @@ def print_instance_status(instance: dict, stats: dict, cost_cents: int, budget_i
     else:
         line1 = f"  {status:<12}  IP: {ip:<15}  Type: {itype}"
     print(f"│{line1:<{W}}│")
-    line2 = f"  Key: {ssh_key:<18}  Cost: {cost:<8}  Samples: {stats['samples_24h']} (24h)"
+    # Account info
+    account_name = instance.get("account") or "default"
+    line2 = f"  Account: {account_name:<12}  Key: {ssh_key:<14}  Cost: {cost}"
     print(f"│{line2:<{W}}│")
     if budget_str:
         line2b = f"  Budget: {budget_str}"
@@ -343,9 +325,11 @@ def main():
                 print("No active instances found.")
             return
         
-        # Load budget config and costs
-        budget_data = load_budgets()
-        all_costs = {c["ssh_key"]: c["total_cents"] for c in db.get_all_costs(conn)}
+        # Load account config and costs
+        accounts_data = utils_accounts.load_accounts()
+        accounts_list = utils_accounts.get_account_list(accounts_data)
+        account_budgets = {acc["name"]: acc for acc in accounts_list}
+        account_costs = {c["account"]: c["total_cents"] for c in db.get_all_account_costs(conn)}
         
         # Build results with stats
         results = []
@@ -356,13 +340,13 @@ def main():
                 ssh_keys = json.loads(ssh_keys)
             cost = get_cost_for_key(conn, ssh_keys[0]) if ssh_keys else 0
             
-            # Get budget info for this instance's SSH key
+            # Get budget info for this instance's account
+            account_name = inst.get("account") or "default"
             budget_info = None
-            if ssh_keys:
-                ssh_key = ssh_keys[0]
-                limit = get_budget_for_key(budget_data, ssh_key)
-                spent = all_costs.get(ssh_key, 0)
-                budget_info = {"limit": limit, "spent": spent}
+            if account_name in account_budgets:
+                acc = account_budgets[account_name]
+                spent = account_costs.get(account_name, 0)
+                budget_info = {"limit": acc["limit_cents"], "spent": spent, "account": account_name}
             
             results.append({
                 "instance": inst,
@@ -385,6 +369,7 @@ def main():
                 budget_info = r.get("budget_info")
                 output.append({
                     "id": inst["id"],
+                    "account": inst.get("account") or "default",
                     "hostname": inst.get("hostname"),
                     "custom_name": inst.get("name"),
                     "ip": inst.get("ip"),

@@ -5,10 +5,11 @@ config.env
 keys/*
 !keys/.gitkeep
 
-# Data directory (except examples)
+# Data directory (except .example files)
 data/state.db
 data/*.json
 data/budgets.yaml
+data/accounts.yaml
 
 # Backups
 ./backup

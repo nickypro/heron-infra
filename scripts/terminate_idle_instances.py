@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Terminate Lambda instances that have been idle (0% GPU) for too long.
+Supports multiple Lambda Labs accounts.
 Run via cron separately from monitor.py for independent control.
 """
 
@@ -9,6 +10,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import utils_accounts
 import utils_db as db
 import utils_lambda_api as lambda_api
 
@@ -82,7 +84,7 @@ def is_whitelisted(instance: dict) -> bool:
     return "whitelist" in custom_name.lower()
 
 
-def check_and_terminate_idle(conn, instance: dict, dry_run: bool = False) -> bool:
+def check_and_terminate_idle(conn, instance: dict, api_key: str, dry_run: bool = False) -> bool:
     """
     Check if instance should be terminated. Both conditions must be met:
     1. Running for at least MIN_RUNTIME_HOURS
@@ -92,24 +94,24 @@ def check_and_terminate_idle(conn, instance: dict, dry_run: bool = False) -> boo
     
     Returns True if instance was (or would be) terminated.
     """
-    name = instance["hostname"] or instance["id"][:8]
+    name = instance.get("hostname") or instance.get("name") or instance["id"][:8]
     now = time.time()
     
     # Check whitelist
     if is_whitelisted(instance):
-        log(f"  {name}: Whitelisted - skipping")
+        log(f"    {name}: Whitelisted - skipping")
         return False
     
     # Condition 1: Check minimum runtime
     first_seen = instance.get("first_seen")
     if not first_seen:
-        log(f"  {name}: No first_seen timestamp, skipping")
+        log(f"    {name}: No first_seen timestamp, skipping")
         return False
     
     runtime_hours = (now - first_seen) / 3600
     if runtime_hours < MIN_RUNTIME_HOURS:
         remaining = MIN_RUNTIME_HOURS - runtime_hours
-        log(f"  {name}: Running {runtime_hours:.1f}h (need {MIN_RUNTIME_HOURS}h min, {remaining:.1f}h to go)")
+        log(f"    {name}: Running {runtime_hours:.1f}h (need {MIN_RUNTIME_HOURS}h min, {remaining:.1f}h to go)")
         return False
     
     # Condition 2: Check idle time
@@ -122,7 +124,7 @@ def check_and_terminate_idle(conn, instance: dict, dry_run: bool = False) -> boo
     # Need at least some time points to make a decision (80% coverage)
     min_samples = int(IDLE_SHUTDOWN_HOURS * 60 * 0.8)
     if len(grouped) < min_samples:
-        log(f"  {name}: Not enough samples ({len(grouped)}/{min_samples}) - skipping")
+        log(f"    {name}: Not enough samples ({len(grouped)}/{min_samples}) - skipping")
         return False
     
     # Check if all time points have all GPUs at 0%
@@ -135,26 +137,50 @@ def check_and_terminate_idle(conn, instance: dict, dry_run: bool = False) -> boo
             last_activity = max(non_zero_times)
             idle_hours = (now - last_activity) / 3600
             remaining = IDLE_SHUTDOWN_HOURS - idle_hours
-            log(f"  {name}: Running {runtime_hours:.1f}h, idle {idle_hours:.1f}h (need {IDLE_SHUTDOWN_HOURS}h idle, {remaining:.1f}h to go)")
+            log(f"    {name}: Running {runtime_hours:.1f}h, idle {idle_hours:.1f}h (need {IDLE_SHUTDOWN_HOURS}h idle, {remaining:.1f}h to go)")
         return False
     
     # Both conditions met - terminate
     if dry_run:
-        log(f"  {name}: WOULD TERMINATE (running {runtime_hours:.1f}h, idle {IDLE_SHUTDOWN_HOURS}+ hours)")
+        log(f"    {name}: WOULD TERMINATE (running {runtime_hours:.1f}h, idle {IDLE_SHUTDOWN_HOURS}+ hours)")
         return True
     
-    log(f"  {name}: Terminating (running {runtime_hours:.1f}h, idle {IDLE_SHUTDOWN_HOURS}+ hours)...")
+    log(f"    {name}: Terminating (running {runtime_hours:.1f}h, idle {IDLE_SHUTDOWN_HOURS}+ hours)...")
     try:
-        terminated = lambda_api.terminate_instance([instance["id"]])
+        terminated = lambda_api.terminate_instance(api_key, [instance["id"]])
         if terminated:
-            log(f"  {name}: Successfully terminated")
+            log(f"    {name}: Successfully terminated")
             return True
         else:
-            log(f"  {name}: Failed to terminate")
+            log(f"    {name}: Failed to terminate")
     except Exception as e:
-        log(f"  {name}: Error terminating: {e}")
+        log(f"    {name}: Error terminating: {e}")
     
     return False
+
+
+def process_account(conn, account: dict, dry_run: bool = False) -> int:
+    """Process idle instance termination for a single account."""
+    account_name = account["name"]
+    api_key = account["api_key"]
+    
+    log(f"  Account: {account_name}")
+    
+    # Get active instances for this account
+    active = db.get_active_instances(conn, account=account_name)
+    
+    if not active:
+        log(f"    No active instances")
+        return 0
+    
+    log(f"    {len(active)} active instances")
+    
+    terminated_count = 0
+    for inst in active:
+        if check_and_terminate_idle(conn, inst, api_key, dry_run=dry_run):
+            terminated_count += 1
+    
+    return terminated_count
 
 
 def main():
@@ -168,20 +194,29 @@ def main():
     
     log(f"Checking for idle instances (min runtime: {MIN_RUNTIME_HOURS}h, idle threshold: {IDLE_SHUTDOWN_HOURS}h)...")
     
+    # Load accounts
+    accounts_data = utils_accounts.load_accounts()
+    accounts = utils_accounts.get_account_list(accounts_data)
+    
+    if not accounts:
+        log("No accounts configured")
+        return
+    
     conn = db.get_db()
     
     try:
-        active = db.get_active_instances(conn)
-        log(f"Found {len(active)} active instances")
+        total_terminated = 0
         
-        terminated_count = 0
-        for inst in active:
-            if check_and_terminate_idle(conn, inst, dry_run=args.dry_run):
-                terminated_count += 1
+        for account in accounts:
+            try:
+                terminated = process_account(conn, account, dry_run=args.dry_run)
+                total_terminated += terminated
+            except Exception as e:
+                log(f"  Error processing account {account['name']}: {e}")
         
-        if terminated_count > 0:
+        if total_terminated > 0:
             action = "would terminate" if args.dry_run else "terminated"
-            log(f"Done: {action} {terminated_count} instance(s)")
+            log(f"Done: {action} {total_terminated} instance(s)")
         else:
             log("Done: No idle instances to terminate")
             

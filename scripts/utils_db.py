@@ -38,7 +38,8 @@ def _init_schema(conn: sqlite3.Connection):
             ssh_key_names TEXT,  -- JSON array
             first_seen REAL,
             last_seen REAL,
-            initialized INTEGER DEFAULT 0
+            initialized INTEGER DEFAULT 0,
+            account TEXT  -- Account name (for multi-account support)
         );
 
         CREATE TABLE IF NOT EXISTS gpu_samples (
@@ -53,8 +54,16 @@ def _init_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_gpu_samples_instance_time 
             ON gpu_samples(instance_id, timestamp);
 
+        -- Legacy per-SSH-key costs (kept for backward compatibility)
         CREATE TABLE IF NOT EXISTS costs (
             ssh_key TEXT PRIMARY KEY,
+            total_cents INTEGER DEFAULT 0,
+            last_updated REAL
+        );
+
+        -- Per-account costs (new)
+        CREATE TABLE IF NOT EXISTS account_costs (
+            account TEXT PRIMARY KEY,
             total_cents INTEGER DEFAULT 0,
             last_updated REAL
         );
@@ -72,27 +81,46 @@ def _init_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_availability_time 
             ON availability(timestamp);
 
+        -- Legacy per-SSH-key notifications (kept for backward compatibility)
         CREATE TABLE IF NOT EXISTS budget_notifications (
             ssh_key TEXT PRIMARY KEY,
             last_notified_cents INTEGER DEFAULT 0,
             last_notified_at REAL
         );
+
+        -- Per-account notifications (new)
+        CREATE TABLE IF NOT EXISTS account_notifications (
+            account TEXT PRIMARY KEY,
+            last_notified_cents INTEGER DEFAULT 0,
+            last_notified_at REAL
+        );
     """)
+    
+    # Migration: add account column to existing instances table if missing
+    try:
+        conn.execute("SELECT account FROM instances LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE instances ADD COLUMN account TEXT")
+    
+    conn.commit()
     conn.commit()
 
 
-def upsert_instance(conn: sqlite3.Connection, instance: dict):
+def upsert_instance(conn: sqlite3.Connection, instance: dict, account: str = None):
     """Insert or update an instance record."""
     now = time.time()
     
-    # Check if instance exists to preserve first_seen
+    # Check if instance exists to preserve first_seen and account
     existing = conn.execute(
-        "SELECT first_seen, initialized FROM instances WHERE id = ?",
+        "SELECT first_seen, initialized, account FROM instances WHERE id = ?",
         (instance["id"],)
     ).fetchone()
     
     first_seen = existing["first_seen"] if existing else now
     initialized = existing["initialized"] if existing else 0
+    # Preserve existing account if not provided
+    if account is None and existing:
+        account = existing["account"]
     
     # Extract instance type info
     itype = instance.get("instance_type", {})
@@ -102,8 +130,8 @@ def upsert_instance(conn: sqlite3.Connection, instance: dict):
     conn.execute("""
         INSERT OR REPLACE INTO instances 
         (id, name, ip, private_ip, status, hostname, region, instance_type,
-         gpu_count, hourly_cost_cents, ssh_key_names, first_seen, last_seen, initialized)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         gpu_count, hourly_cost_cents, ssh_key_names, first_seen, last_seen, initialized, account)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         instance["id"],
         instance.get("name"),
@@ -118,7 +146,8 @@ def upsert_instance(conn: sqlite3.Connection, instance: dict):
         json.dumps(instance.get("ssh_key_names", [])),
         first_seen,
         now,
-        initialized
+        initialized,
+        account
     ))
     conn.commit()
 
@@ -132,20 +161,39 @@ def mark_initialized(conn: sqlite3.Connection, instance_id: str):
     conn.commit()
 
 
-def get_uninitialized_instances(conn: sqlite3.Connection) -> list[dict]:
-    """Get instances that haven't been initialized yet."""
-    rows = conn.execute("""
-        SELECT * FROM instances 
-        WHERE initialized = 0 AND status = 'active'
-    """).fetchall()
+def get_uninitialized_instances(conn: sqlite3.Connection, account: str = None) -> list[dict]:
+    """Get instances that haven't been initialized yet, optionally filtered by account."""
+    if account:
+        rows = conn.execute("""
+            SELECT * FROM instances 
+            WHERE initialized = 0 AND status = 'active' AND account = ?
+        """, (account,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT * FROM instances 
+            WHERE initialized = 0 AND status = 'active'
+        """).fetchall()
     return [dict(row) for row in rows]
 
 
-def get_active_instances(conn: sqlite3.Connection) -> list[dict]:
-    """Get all active instances."""
+def get_active_instances(conn: sqlite3.Connection, account: str = None) -> list[dict]:
+    """Get all active instances, optionally filtered by account."""
+    if account:
+        rows = conn.execute("""
+            SELECT * FROM instances WHERE status = 'active' AND account = ?
+        """, (account,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT * FROM instances WHERE status = 'active'
+        """).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_instances_by_account(conn: sqlite3.Connection, account: str) -> list[dict]:
+    """Get all instances for a specific account."""
     rows = conn.execute("""
-        SELECT * FROM instances WHERE status = 'active'
-    """).fetchall()
+        SELECT * FROM instances WHERE account = ?
+    """, (account,)).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -169,7 +217,7 @@ def get_gpu_samples_since(conn: sqlite3.Connection, instance_id: str, since_time
 
 
 def update_cost(conn: sqlite3.Connection, ssh_key: str, cents_to_add: int):
-    """Add cost to an SSH key's running total."""
+    """Add cost to an SSH key's running total (legacy, kept for compatibility)."""
     now = time.time()
     conn.execute("""
         INSERT INTO costs (ssh_key, total_cents, last_updated)
@@ -182,9 +230,37 @@ def update_cost(conn: sqlite3.Connection, ssh_key: str, cents_to_add: int):
 
 
 def get_all_costs(conn: sqlite3.Connection) -> list[dict]:
-    """Get cost totals for all SSH keys."""
+    """Get cost totals for all SSH keys (legacy)."""
     rows = conn.execute("SELECT * FROM costs ORDER BY total_cents DESC").fetchall()
     return [dict(row) for row in rows]
+
+
+def update_account_cost(conn: sqlite3.Connection, account: str, cents_to_add: int):
+    """Add cost to an account's running total."""
+    now = time.time()
+    conn.execute("""
+        INSERT INTO account_costs (account, total_cents, last_updated)
+        VALUES (?, ?, ?)
+        ON CONFLICT(account) DO UPDATE SET
+            total_cents = total_cents + excluded.total_cents,
+            last_updated = excluded.last_updated
+    """, (account, cents_to_add, now))
+    conn.commit()
+
+
+def get_all_account_costs(conn: sqlite3.Connection) -> list[dict]:
+    """Get cost totals for all accounts."""
+    rows = conn.execute("SELECT * FROM account_costs ORDER BY total_cents DESC").fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_account_cost(conn: sqlite3.Connection, account: str) -> int:
+    """Get total cost for a specific account."""
+    row = conn.execute(
+        "SELECT total_cents FROM account_costs WHERE account = ?",
+        (account,)
+    ).fetchone()
+    return row["total_cents"] if row else 0
 
 
 def cleanup_old_samples(conn: sqlite3.Connection, older_than_hours: int = 24):
@@ -225,7 +301,7 @@ def cleanup_old_availability(conn: sqlite3.Connection, older_than_hours: int = 1
 
 
 def get_budget_notification(conn: sqlite3.Connection, ssh_key: str) -> dict | None:
-    """Get the last notification info for an SSH key."""
+    """Get the last notification info for an SSH key (legacy)."""
     row = conn.execute(
         "SELECT * FROM budget_notifications WHERE ssh_key = ?",
         (ssh_key,)
@@ -234,7 +310,7 @@ def get_budget_notification(conn: sqlite3.Connection, ssh_key: str) -> dict | No
 
 
 def update_budget_notification(conn: sqlite3.Connection, ssh_key: str, notified_cents: int):
-    """Update the last notified amount for an SSH key."""
+    """Update the last notified amount for an SSH key (legacy)."""
     now = time.time()
     conn.execute("""
         INSERT INTO budget_notifications (ssh_key, last_notified_cents, last_notified_at)
@@ -243,6 +319,28 @@ def update_budget_notification(conn: sqlite3.Connection, ssh_key: str, notified_
             last_notified_cents = excluded.last_notified_cents,
             last_notified_at = excluded.last_notified_at
     """, (ssh_key, notified_cents, now))
+    conn.commit()
+
+
+def get_account_notification(conn: sqlite3.Connection, account: str) -> dict | None:
+    """Get the last notification info for an account."""
+    row = conn.execute(
+        "SELECT * FROM account_notifications WHERE account = ?",
+        (account,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def update_account_notification(conn: sqlite3.Connection, account: str, notified_cents: int):
+    """Update the last notified amount for an account."""
+    now = time.time()
+    conn.execute("""
+        INSERT INTO account_notifications (account, last_notified_cents, last_notified_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(account) DO UPDATE SET
+            last_notified_cents = excluded.last_notified_cents,
+            last_notified_at = excluded.last_notified_at
+    """, (account, notified_cents, now))
     conn.commit()
 
 

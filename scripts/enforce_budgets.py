@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Enforce budget limits per SSH key.
-- Terminate instances when SSH key exceeds budget (unless "OVERBUDGET" in name)
+Enforce budget limits per Lambda account.
+- Terminate instances when account exceeds budget (unless "OVERBUDGET" in name)
 - Send Discord notifications at spending milestones
 
+Supports multiple Lambda Labs accounts.
 Run via cron every 5 minutes.
 """
 
@@ -13,14 +14,12 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
-import yaml
 
+import utils_accounts
 import utils_db as db
 import utils_lambda_api as lambda_api
 
 PROJECT_DIR = Path(__file__).parent.parent
-DATA_DIR = PROJECT_DIR / "data"
-BUDGETS_FILE = DATA_DIR / "budgets.yaml"
 
 
 def load_config():
@@ -48,43 +47,6 @@ def log(msg: str):
     print(f"[{ts}] {msg}")
 
 
-def load_budgets() -> dict:
-    """Load budgets.yaml, creating default if it doesn't exist."""
-    DATA_DIR.mkdir(exist_ok=True)
-    
-    if BUDGETS_FILE.exists():
-        with open(BUDGETS_FILE) as f:
-            data = yaml.safe_load(f) or {}
-    else:
-        data = {}
-    
-    # Ensure structure
-    if "defaults" not in data:
-        data["defaults"] = {
-            "limit_cents": DEFAULT_LIMIT,
-            "milestone_interval": MILESTONE_INTERVAL,
-        }
-    if "keys" not in data:
-        data["keys"] = {}
-    
-    return data
-
-
-def get_limit_for_key(data: dict, ssh_key: str) -> int:
-    """Get the effective limit for an SSH key (custom or default)."""
-    key_config = data.get("keys", {}).get(ssh_key, {})
-    limit = key_config.get("limit_cents", "default")
-    if limit == "default" or limit is None:
-        return data["defaults"]["limit_cents"]
-    return int(limit)
-
-
-def get_webhook_for_key(data: dict, ssh_key: str) -> str | None:
-    """Get the Discord webhook URL for an SSH key."""
-    key_config = data.get("keys", {}).get(ssh_key, {})
-    return key_config.get("discord_webhook")
-
-
 def format_money(cents: int | float) -> str:
     """Format cents as dollar string."""
     return f"${cents / 100:,.2f}"
@@ -96,7 +58,7 @@ def is_overbudget_allowed(instance: dict) -> bool:
     return "overbudget" in custom_name.lower()
 
 
-def send_discord_notification(webhook_url: str, ssh_key: str, spent_cents: int, limit_cents: int, is_over_budget: bool = False):
+def send_discord_notification(webhook_url: str, account_name: str, spent_cents: int, limit_cents: int, is_over_budget: bool = False):
     """Send a Discord webhook notification."""
     if not webhook_url:
         return False
@@ -104,8 +66,9 @@ def send_discord_notification(webhook_url: str, ssh_key: str, spent_cents: int, 
     try:
         if is_over_budget:
             color = 0xFF0000  # Red
-            title = f"⚠️ Budget Exceeded: {ssh_key}"
+            title = f"⚠️ Budget Exceeded: {account_name}"
             description = (
+                f"**Account:** {account_name}\n"
                 f"**Spent:** {format_money(spent_cents)}\n"
                 f"**Limit:** {format_money(limit_cents)}\n"
                 f"**Over by:** {format_money(spent_cents - limit_cents)}\n\n"
@@ -113,9 +76,10 @@ def send_discord_notification(webhook_url: str, ssh_key: str, spent_cents: int, 
             )
         else:
             color = 0xFFA500  # Orange
-            title = f"💰 Spending Milestone: {ssh_key}"
+            title = f"💰 Spending Milestone: {account_name}"
             remaining = limit_cents - spent_cents
             description = (
+                f"**Account:** {account_name}\n"
                 f"**Spent:** {format_money(spent_cents)}\n"
                 f"**Limit:** {format_money(limit_cents)}\n"
                 f"**Remaining:** {format_money(remaining)}"
@@ -136,20 +100,22 @@ def send_discord_notification(webhook_url: str, ssh_key: str, spent_cents: int, 
         return True
         
     except Exception as e:
-        log(f"  Failed to send Discord notification: {e}")
+        log(f"    Failed to send Discord notification: {e}")
         return False
 
 
-def check_milestone_notification(conn, data: dict, ssh_key: str, spent_cents: int, limit_cents: int) -> bool:
+def check_milestone_notification(conn, account: dict, spent_cents: int, accounts_data: dict) -> bool:
     """Check if we should send a milestone notification and send it if needed."""
-    webhook_url = get_webhook_for_key(data, ssh_key)
+    account_name = account["name"]
+    webhook_url = account.get("discord_webhook")
     if not webhook_url:
         return False
     
-    milestone_interval = data["defaults"].get("milestone_interval", MILESTONE_INTERVAL)
+    limit_cents = account["limit_cents"]
+    milestone_interval = accounts_data.get("defaults", {}).get("milestone_interval", MILESTONE_INTERVAL)
     
     # Get last notification info
-    notif = db.get_budget_notification(conn, ssh_key)
+    notif = db.get_account_notification(conn, account_name)
     last_notified = notif["last_notified_cents"] if notif else 0
     
     # Calculate current milestone level
@@ -158,64 +124,65 @@ def check_milestone_notification(conn, data: dict, ssh_key: str, spent_cents: in
     
     # Check if we crossed a milestone
     if current_milestone > last_milestone and current_milestone > 0:
-        log(f"  {ssh_key}: Crossed milestone {format_money(current_milestone)}")
+        log(f"    Crossed milestone {format_money(current_milestone)}")
         
         is_over_budget = spent_cents > limit_cents
-        if send_discord_notification(webhook_url, ssh_key, spent_cents, limit_cents, is_over_budget):
-            db.update_budget_notification(conn, ssh_key, spent_cents)
+        if send_discord_notification(webhook_url, account_name, spent_cents, limit_cents, is_over_budget):
+            db.update_account_notification(conn, account_name, spent_cents)
             return True
     
     return False
 
 
-def enforce_budget_for_key(conn, data: dict, ssh_key: str, spent_cents: int, active_instances: list[dict], dry_run: bool = False) -> int:
+def enforce_budget_for_account(conn, account: dict, accounts_data: dict, dry_run: bool = False) -> int:
     """
-    Enforce budget for a single SSH key.
+    Enforce budget for a single account.
     Returns number of instances terminated.
     """
-    limit = get_limit_for_key(data, ssh_key)
+    account_name = account["name"]
+    api_key = account["api_key"]
+    limit_cents = account["limit_cents"]
+    webhook_url = account.get("discord_webhook")
+    
+    # Get current spending for this account
+    spent_cents = db.get_account_cost(conn, account_name)
+    
+    log(f"  Account: {account_name} - {format_money(spent_cents)}/{format_money(limit_cents)}")
     
     # Check milestone notifications first (even if under budget)
-    check_milestone_notification(conn, data, ssh_key, spent_cents, limit)
+    check_milestone_notification(conn, account, spent_cents, accounts_data)
     
-    if spent_cents <= limit:
+    if spent_cents <= limit_cents:
         # Under budget, nothing to enforce
-        remaining = limit - spent_cents
-        remaining_pct = (remaining / limit) * 100 if limit > 0 else 100
+        remaining = limit_cents - spent_cents
+        remaining_pct = (remaining / limit_cents) * 100 if limit_cents > 0 else 100
         if remaining_pct < 20:
-            log(f"  {ssh_key}: {format_money(spent_cents)}/{format_money(limit)} (⚠ {remaining_pct:.0f}% remaining)")
+            log(f"    ⚠ Only {remaining_pct:.0f}% remaining ({format_money(remaining)})")
         return 0
     
     # Over budget!
-    over_by = spent_cents - limit
-    log(f"  {ssh_key}: OVER BUDGET by {format_money(over_by)} ({format_money(spent_cents)}/{format_money(limit)})")
+    over_by = spent_cents - limit_cents
+    log(f"    OVER BUDGET by {format_money(over_by)}")
     
-    # Find instances for this SSH key
-    key_instances = []
-    for inst in active_instances:
-        ssh_keys = inst.get("ssh_key_names", [])
-        if isinstance(ssh_keys, str):
-            ssh_keys = json.loads(ssh_keys)
-        if ssh_key in ssh_keys:
-            key_instances.append(inst)
+    # Get active instances for this account
+    active_instances = db.get_active_instances(conn, account=account_name)
     
-    if not key_instances:
-        log(f"  {ssh_key}: No active instances to terminate")
+    if not active_instances:
+        log(f"    No active instances to terminate")
         return 0
     
     # Send over-budget notification (only once when first going over)
-    webhook_url = get_webhook_for_key(data, ssh_key)
     if webhook_url:
-        notif = db.get_budget_notification(conn, ssh_key)
+        notif = db.get_account_notification(conn, account_name)
         last_notified = notif["last_notified_cents"] if notif else 0
         # Only send over-budget alert if we haven't notified at this level
-        if last_notified < limit:
-            send_discord_notification(webhook_url, ssh_key, spent_cents, limit, is_over_budget=True)
-            db.update_budget_notification(conn, ssh_key, spent_cents)
+        if last_notified < limit_cents:
+            send_discord_notification(webhook_url, account_name, spent_cents, limit_cents, is_over_budget=True)
+            db.update_account_notification(conn, account_name, spent_cents)
     
     # Terminate instances (except those with OVERBUDGET in name)
     terminated = 0
-    for inst in key_instances:
+    for inst in active_instances:
         name = inst.get("hostname") or inst.get("name") or inst["id"][:8]
         
         if is_overbudget_allowed(inst):
@@ -229,7 +196,7 @@ def enforce_budget_for_key(conn, data: dict, ssh_key: str, spent_cents: int, act
         
         log(f"    {name}: Terminating (over budget)...")
         try:
-            result = lambda_api.terminate_instance([inst["id"]])
+            result = lambda_api.terminate_instance(api_key, [inst["id"]])
             if result:
                 log(f"    {name}: Successfully terminated")
                 terminated += 1
@@ -243,39 +210,40 @@ def enforce_budget_for_key(conn, data: dict, ssh_key: str, spent_cents: int, act
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Enforce budget limits per SSH key")
+    parser = argparse.ArgumentParser(description="Enforce budget limits per account")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done without terminating")
     args = parser.parse_args()
     
     if args.dry_run:
         log("DRY RUN - no instances will be terminated")
     
-    log("Checking budget limits...")
+    log("Checking account budget limits...")
     
-    data = load_budgets()
+    # Load accounts
+    accounts_data = utils_accounts.load_accounts()
+    accounts = utils_accounts.get_account_list(accounts_data)
+    
+    if not accounts:
+        log("No accounts configured")
+        return
+    
     conn = db.get_db()
     
     try:
-        # Get current costs per SSH key
-        costs = {c["ssh_key"]: c["total_cents"] for c in db.get_all_costs(conn)}
-        
-        if not costs:
-            log("No spending data found")
-            return
-        
-        # Get all active instances
-        active_instances = db.get_active_instances(conn)
-        
         total_terminated = 0
-        for ssh_key, spent_cents in costs.items():
-            terminated = enforce_budget_for_key(conn, data, ssh_key, spent_cents, active_instances, dry_run=args.dry_run)
-            total_terminated += terminated
+        
+        for account in accounts:
+            try:
+                terminated = enforce_budget_for_account(conn, account, accounts_data, dry_run=args.dry_run)
+                total_terminated += terminated
+            except Exception as e:
+                log(f"  Error processing account {account['name']}: {e}")
         
         if total_terminated > 0:
             action = "would terminate" if args.dry_run else "terminated"
             log(f"Done: {action} {total_terminated} instance(s)")
         else:
-            log("Done: All budgets OK")
+            log("Done: All account budgets OK")
             
     except Exception as e:
         log(f"Error: {e}")

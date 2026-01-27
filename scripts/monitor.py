@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Monitor Lambda instances: track state, GPU usage, costs, and manage SSH config.
+Supports multiple Lambda Labs accounts.
 Run via cron every minute.
 """
 
@@ -12,6 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import utils_accounts
 import utils_db as db
 import utils_lambda_api as lambda_api
 
@@ -152,7 +154,7 @@ def get_gpu_utilization(instance: dict) -> list[int]:
 def initialize_machine(instance: dict) -> bool:
     """Run init script on a new machine. Returns True on success."""
     if not INIT_SCRIPT_PATH:
-        log(f"No init script configured, skipping initialization for {instance['name']}")
+        log(f"No init script configured, skipping initialization for {instance.get('name')}")
         return True
     
     init_script = Path(INIT_SCRIPT_PATH)
@@ -165,7 +167,7 @@ def initialize_machine(instance: dict) -> bool:
     
     ip = instance["ip"]
     key_path = get_ssh_key_for_instance(instance)
-    log(f"Initializing machine {instance['name']} ({ip}) with key {key_path.name}...")
+    log(f"Initializing machine {instance.get('name')} ({ip}) with key {key_path.name}...")
     
     # Copy init script to remote
     scp_opts = [
@@ -193,7 +195,7 @@ def initialize_machine(instance: dict) -> bool:
         log(f"Init script failed on {ip}: {output}")
         return False
     
-    log(f"Successfully initialized {instance['name']}")
+    log(f"Successfully initialized {instance.get('name')}")
     return True
 
 
@@ -227,6 +229,11 @@ def update_ssh_config(instances: list[dict]):
         # Sanitize hostname for SSH config
         host_name = host_name.replace(" ", "-").lower()
         
+        # Prepend account name if not "default" to avoid name collisions
+        account = inst.get("account")
+        if account and account != "default":
+            host_name = f"{account}-{host_name}"
+        
         # Get the right SSH key for this instance
         key_path = get_ssh_key_for_instance(inst)
         
@@ -237,6 +244,7 @@ def update_ssh_config(instances: list[dict]):
         lambda_section += f"    StrictHostKeyChecking no\n"
         lambda_section += f"    UserKnownHostsFile /dev/null\n"
         lambda_section += f"    # Instance ID: {inst['id']}\n"
+        lambda_section += f"    # Account: {account or 'default'}\n"
         lambda_section += f"    # Type: {inst.get('instance_type', 'unknown')}\n"
         lambda_section += "\n"
     
@@ -255,9 +263,11 @@ def update_ssh_config(instances: list[dict]):
     log(f"Updated SSH config with {len([i for i in instances if i.get('status') == 'active'])} instances")
 
 
-def update_costs(conn, instances: list[dict]):
-    """Update cost tracking for each SSH key."""
+def update_costs(conn, instances: list[dict], account: str):
+    """Update cost tracking for the account."""
     # Cost per minute = hourly_cost / 60
+    total_cost_per_minute = 0
+    
     for inst in instances:
         if inst.get("status") != "active":
             continue
@@ -267,65 +277,100 @@ def update_costs(conn, instances: list[dict]):
             continue
         
         cost_per_minute = hourly_cents / 60
+        total_cost_per_minute += cost_per_minute
         
-        # Attribute cost to first SSH key
+        # Also track per-SSH-key for backward compatibility
         ssh_keys = inst.get("ssh_key_names")
         if isinstance(ssh_keys, str):
             ssh_keys = json.loads(ssh_keys)
         
         if ssh_keys:
             db.update_cost(conn, ssh_keys[0], int(cost_per_minute))
+    
+    # Update account cost
+    if total_cost_per_minute > 0:
+        db.update_account_cost(conn, account, int(total_cost_per_minute))
+
+
+def process_account(conn, account: dict) -> list[dict]:
+    """Process a single account and return its instances."""
+    account_name = account["name"]
+    api_key = account["api_key"]
+    
+    log(f"Processing account: {account_name}")
+    
+    # Fetch instances from API
+    instances = lambda_api.list_instances(api_key)
+    log(f"  Found {len(instances)} instances")
+    
+    # Update instance records in DB (with account name)
+    for inst in instances:
+        db.upsert_instance(conn, inst, account=account_name)
+    
+    # Check for new (uninitialized) instances
+    uninitialized = db.get_uninitialized_instances(conn, account=account_name)
+    for inst in uninitialized:
+        if inst.get("ip"):
+            log(f"  New instance detected: {inst.get('name')} ({inst['ip']})")
+            if initialize_machine(inst):
+                db.mark_initialized(conn, inst["id"])
+    
+    # Get GPU utilization for active instances
+    active = db.get_active_instances(conn, account=account_name)
+    for inst in active:
+        if not inst.get("ip"):
+            continue
+        
+        gpu_utils = get_gpu_utilization(inst)
+        for gpu_idx, util in enumerate(gpu_utils):
+            db.add_gpu_sample(conn, inst["id"], util, gpu_idx)
+        
+        if gpu_utils:
+            log(f"  {inst.get('name')}: GPU = {gpu_utils}")
+    
+    # Update costs for this account
+    update_costs(conn, active, account_name)
+    
+    return active
 
 
 def main():
     log("Starting monitor run...")
     
+    # Load accounts
+    accounts_data = utils_accounts.load_accounts()
+    accounts = utils_accounts.get_account_list(accounts_data)
+    
+    if not accounts:
+        log("No accounts configured. Add accounts to data/accounts.yaml or set LAMBDA_API_KEY in config.env")
+        return
+    
     conn = db.get_db()
     
     try:
-        # 1. Fetch instances from API
-        log("Fetching instances from API...")
-        instances = lambda_api.list_instances()
-        log(f"Found {len(instances)} instances")
+        all_active_instances = []
         
-        # 2. Update instance records in DB
-        for inst in instances:
-            db.upsert_instance(conn, inst)
+        # Process each account
+        for account in accounts:
+            try:
+                active = process_account(conn, account)
+                # Add account info to instances for SSH config
+                for inst in active:
+                    inst["account"] = account["name"]
+                all_active_instances.extend(active)
+            except Exception as e:
+                log(f"Error processing account {account['name']}: {e}")
         
-        # 3. Check for new (uninitialized) instances
-        uninitialized = db.get_uninitialized_instances(conn)
-        for inst in uninitialized:
-            if inst.get("ip"):
-                log(f"New instance detected: {inst['name']} ({inst['ip']})")
-                if initialize_machine(inst):
-                    db.mark_initialized(conn, inst["id"])
+        # Update SSH config with instances from all accounts
+        update_ssh_config(all_active_instances)
         
-        # 4. Get GPU utilization for active instances
-        active = db.get_active_instances(conn)
-        for inst in active:
-            if not inst.get("ip"):
-                continue
-            
-            gpu_utils = get_gpu_utilization(inst)
-            for gpu_idx, util in enumerate(gpu_utils):
-                db.add_gpu_sample(conn, inst["id"], util, gpu_idx)
-            
-            if gpu_utils:
-                log(f"{inst['name']}: GPU utilization = {gpu_utils}")
-        
-        # 5. Update costs
-        update_costs(conn, active)
-        
-        # 6. Update SSH config
-        update_ssh_config(active)
-        
-        # 7. Export to JSON for inspection
+        # Export to JSON for inspection
         db.export_to_json(conn)
         
-        # 8. Cleanup old samples (keep 24 hours)
+        # Cleanup old samples (keep 24 hours)
         db.cleanup_old_samples(conn, older_than_hours=24)
         
-        log("Monitor run complete")
+        log(f"Monitor run complete ({len(accounts)} accounts, {len(all_active_instances)} instances)")
         
     except Exception as e:
         log(f"Error during monitor run: {e}")

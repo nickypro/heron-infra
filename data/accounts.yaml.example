@@ -1,0 +1,23 @@
+# Lambda Labs accounts configuration
+# Copy this file to accounts.yaml and fill in your API keys
+#
+# Each account has a name, API key, and optional budget settings
+# limit_cents: budget limit in cents, or 'default' to use defaults.limit_cents
+# discord_webhook: optional URL for spending notifications
+
+defaults:
+  limit_cents: 500000           # $5000 default budget per account
+  milestone_interval: 100000    # Notify every $1000 spent
+
+accounts:
+  # Example: personal account with default budget
+  personal:
+    api_key: "your-api-key-here"
+    limit_cents: default
+    discord_webhook: null
+
+  # Example: production account with higher budget and Discord alerts
+  # company-prod:
+  #   api_key: "another-api-key-here"
+  #   limit_cents: 2000000       # $20,000
+  #   discord_webhook: https://discord.com/api/webhooks/xxx/yyy

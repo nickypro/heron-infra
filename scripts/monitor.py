@@ -141,14 +141,57 @@ def get_gpu_utilization(instance: dict) -> list[int]:
     exit_code, output = ssh_command(ip, cmd, key_path)
     
     if exit_code != 0:
-        log(f"Failed to get GPU stats from {ip}: {output}")
+        log(f"  Failed to get GPU stats from {ip}: {output}")
         return []
     
     try:
         return [int(line.strip()) for line in output.split("\n") if line.strip()]
     except ValueError:
-        log(f"Failed to parse GPU stats from {ip}: {output}")
+        log(f"  Failed to parse GPU stats from {ip}: {output}")
         return []
+
+
+def get_storage_usage(instance: dict) -> list[dict]:
+    """
+    Get disk storage usage from a machine.
+    Returns list of dicts with {mount_point, total_gb, used_gb, available_gb, use_percent}.
+    """
+    ip = instance.get("ip")
+    if not ip:
+        return []
+    
+    key_path = get_ssh_key_for_instance(instance)
+    # Get disk usage for relevant mount points (exclude tmpfs, devtmpfs, etc.)
+    cmd = "df -BG --output=target,size,used,avail,pcent 2>/dev/null | grep -E '^(/|/home|/lambda)' | head -10"
+    exit_code, output = ssh_command(ip, cmd, key_path)
+    
+    if exit_code != 0:
+        return []
+    
+    results = []
+    try:
+        for line in output.split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) >= 5:
+                mount_point = parts[0]
+                # Parse sizes (remove 'G' suffix)
+                total_gb = float(parts[1].rstrip('G'))
+                used_gb = float(parts[2].rstrip('G'))
+                available_gb = float(parts[3].rstrip('G'))
+                use_percent = int(parts[4].rstrip('%'))
+                results.append({
+                    "mount_point": mount_point,
+                    "total_gb": total_gb,
+                    "used_gb": used_gb,
+                    "available_gb": available_gb,
+                    "use_percent": use_percent,
+                })
+    except (ValueError, IndexError) as e:
+        log(f"  Failed to parse storage stats from {ip}: {e}")
+    
+    return results
 
 
 def initialize_machine(instance: dict) -> bool:
@@ -304,8 +347,16 @@ def process_account(conn, account: dict) -> list[dict]:
     log(f"  Found {len(instances)} instances")
     
     # Update instance records in DB (with account name)
+    # This captures hourly_cost_cents from the API response
     for inst in instances:
         db.upsert_instance(conn, inst, account=account_name)
+    
+    # Get active instances from DB (now have hourly_cost_cents)
+    active = db.get_active_instances(conn, account=account_name)
+    
+    # ALWAYS update costs for active instances (regardless of SSH success)
+    # This ensures costs are tracked even if we can't connect to the machines
+    update_costs(conn, active, account_name)
     
     # Check for new (uninitialized) instances
     uninitialized = db.get_uninitialized_instances(conn, account=account_name)
@@ -315,21 +366,40 @@ def process_account(conn, account: dict) -> list[dict]:
             if initialize_machine(inst):
                 db.mark_initialized(conn, inst["id"])
     
-    # Get GPU utilization for active instances
-    active = db.get_active_instances(conn, account=account_name)
+    # Get GPU and storage stats for active instances (may fail if SSH unavailable)
     for inst in active:
         if not inst.get("ip"):
             continue
         
+        name = inst.get("name") or inst.get("hostname") or inst["id"][:8]
+        
+        # GPU utilization
         gpu_utils = get_gpu_utilization(inst)
         for gpu_idx, util in enumerate(gpu_utils):
             db.add_gpu_sample(conn, inst["id"], util, gpu_idx)
         
-        if gpu_utils:
-            log(f"  {inst.get('name')}: GPU = {gpu_utils}")
-    
-    # Update costs for this account
-    update_costs(conn, active, account_name)
+        # Storage utilization
+        storage_stats = get_storage_usage(inst)
+        for storage in storage_stats:
+            db.add_storage_sample(
+                conn, inst["id"], 
+                storage["mount_point"],
+                storage["total_gb"],
+                storage["used_gb"],
+                storage["available_gb"],
+                storage["use_percent"]
+            )
+        
+        # Log summary
+        if gpu_utils or storage_stats:
+            parts = []
+            if gpu_utils:
+                parts.append(f"GPU={gpu_utils}")
+            if storage_stats:
+                root_storage = next((s for s in storage_stats if s["mount_point"] == "/"), None)
+                if root_storage:
+                    parts.append(f"Disk={root_storage['use_percent']}%")
+            log(f"  {name}: {', '.join(parts)}")
     
     return active
 

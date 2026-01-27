@@ -120,6 +120,11 @@ def get_instance_stats(conn, instance: dict) -> dict:
     time_until_min_runtime = max(0, MIN_RUNTIME_HOURS - runtime_hours)
     runtime_met = runtime_hours >= MIN_RUNTIME_HOURS
     
+    # Get latest storage info
+    storage = db.get_latest_storage(conn, instance_id)
+    root_storage = next((s for s in storage if s["mount_point"] == "/"), None)
+    home_storage = next((s for s in storage if s["mount_point"] == "/home"), None)
+    
     stats = {
         "samples_24h": len(grouped_24h),  # Count of time points, not individual GPU samples
         "samples_idle_window": len(grouped_idle),
@@ -134,6 +139,8 @@ def get_instance_stats(conn, instance: dict) -> dict:
         "idle_met": False,
         "will_terminate": False,
         "is_active": False,
+        "storage_root": root_storage,
+        "storage_home": home_storage,
     }
     
     if not grouped_24h:
@@ -298,6 +305,13 @@ def print_instance_status(instance: dict, stats: dict, cost_cents: int, budget_i
         print(f"│{line2b:<{W}}│")
     line3 = f"  {gpu_label}: {gpu_now:<4} now, {gpu_1h:<4} 1h avg"
     print(f"│{line3:<{W}}│")
+    
+    # Storage info
+    root_storage = stats.get("storage_root")
+    if root_storage:
+        disk_str = f"  Disk: {root_storage['use_percent']}% used ({root_storage['used_gb']:.0f}G/{root_storage['total_gb']:.0f}G)"
+        print(f"│{disk_str:<{W}}│")
+    
     line4 = f"  Runtime: {runtime_str:<6} (min {MIN_RUNTIME_HOURS}h) {runtime_check}"
     print(f"│{line4:<{W}}│")
     line5 = f"  Idle:    {idle_str:<6} (max {IDLE_SHUTDOWN_HOURS}h) {idle_check}"
@@ -367,6 +381,7 @@ def main():
                 if isinstance(ssh_keys, str):
                     ssh_keys = json.loads(ssh_keys)
                 budget_info = r.get("budget_info")
+                root_storage = stats.get("storage_root")
                 output.append({
                     "id": inst["id"],
                     "account": inst.get("account") or "default",
@@ -383,6 +398,9 @@ def main():
                     "budget_spent_cents": budget_info["spent"] if budget_info else None,
                     "current_gpu_pct": stats["current_gpu"],
                     "avg_gpu_1h_pct": stats["avg_gpu_1h"],
+                    "storage_used_gb": root_storage["used_gb"] if root_storage else None,
+                    "storage_total_gb": root_storage["total_gb"] if root_storage else None,
+                    "storage_use_pct": root_storage["use_percent"] if root_storage else None,
                     "runtime_hours": stats["runtime_hours"],
                     "runtime_met": stats["runtime_met"],
                     "idle_hours": stats["idle_duration_hours"],

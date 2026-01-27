@@ -54,6 +54,21 @@ def _init_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_gpu_samples_instance_time 
             ON gpu_samples(instance_id, timestamp);
 
+        CREATE TABLE IF NOT EXISTS storage_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id TEXT NOT NULL,
+            mount_point TEXT NOT NULL,
+            total_gb REAL,
+            used_gb REAL,
+            available_gb REAL,
+            use_percent INTEGER,
+            timestamp REAL,
+            FOREIGN KEY (instance_id) REFERENCES instances(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_storage_samples_instance_time 
+            ON storage_samples(instance_id, timestamp);
+
         -- Legacy per-SSH-key costs (kept for backward compatibility)
         CREATE TABLE IF NOT EXISTS costs (
             ssh_key TEXT PRIMARY KEY,
@@ -206,6 +221,38 @@ def add_gpu_sample(conn: sqlite3.Connection, instance_id: str, utilization: int,
     conn.commit()
 
 
+def add_storage_sample(conn: sqlite3.Connection, instance_id: str, mount_point: str, 
+                       total_gb: float, used_gb: float, available_gb: float, use_percent: int):
+    """Record a storage utilization sample."""
+    conn.execute(
+        """INSERT INTO storage_samples 
+           (instance_id, mount_point, total_gb, used_gb, available_gb, use_percent, timestamp) 
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (instance_id, mount_point, total_gb, used_gb, available_gb, use_percent, time.time())
+    )
+    conn.commit()
+
+
+def get_latest_storage(conn: sqlite3.Connection, instance_id: str) -> list[dict]:
+    """Get the most recent storage samples for an instance."""
+    rows = conn.execute("""
+        SELECT mount_point, total_gb, used_gb, available_gb, use_percent, timestamp
+        FROM storage_samples
+        WHERE instance_id = ? AND timestamp > ?
+        ORDER BY timestamp DESC
+    """, (instance_id, time.time() - 3600)).fetchall()  # Last hour
+    
+    # Deduplicate by mount_point (keep most recent)
+    seen = set()
+    results = []
+    for row in rows:
+        mp = row["mount_point"]
+        if mp not in seen:
+            seen.add(mp)
+            results.append(dict(row))
+    return results
+
+
 def get_gpu_samples_since(conn: sqlite3.Connection, instance_id: str, since_timestamp: float) -> list[dict]:
     """Get GPU samples for an instance since a given timestamp."""
     rows = conn.execute("""
@@ -264,9 +311,10 @@ def get_account_cost(conn: sqlite3.Connection, account: str) -> int:
 
 
 def cleanup_old_samples(conn: sqlite3.Connection, older_than_hours: int = 24):
-    """Remove GPU samples older than specified hours."""
+    """Remove GPU and storage samples older than specified hours."""
     cutoff = time.time() - (older_than_hours * 3600)
     conn.execute("DELETE FROM gpu_samples WHERE timestamp < ?", (cutoff,))
+    conn.execute("DELETE FROM storage_samples WHERE timestamp < ?", (cutoff,))
     conn.commit()
 
 

@@ -71,6 +71,12 @@ def _init_schema(conn: sqlite3.Connection):
         
         CREATE INDEX IF NOT EXISTS idx_availability_time 
             ON availability(timestamp);
+
+        CREATE TABLE IF NOT EXISTS budget_notifications (
+            ssh_key TEXT PRIMARY KEY,
+            last_notified_cents INTEGER DEFAULT 0,
+            last_notified_at REAL
+        );
     """)
     conn.commit()
 
@@ -215,6 +221,28 @@ def cleanup_old_availability(conn: sqlite3.Connection, older_than_hours: int = 1
     """Remove availability records older than specified hours (default 1 week)."""
     cutoff = time.time() - (older_than_hours * 3600)
     conn.execute("DELETE FROM availability WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+
+
+def get_budget_notification(conn: sqlite3.Connection, ssh_key: str) -> dict | None:
+    """Get the last notification info for an SSH key."""
+    row = conn.execute(
+        "SELECT * FROM budget_notifications WHERE ssh_key = ?",
+        (ssh_key,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def update_budget_notification(conn: sqlite3.Connection, ssh_key: str, notified_cents: int):
+    """Update the last notified amount for an SSH key."""
+    now = time.time()
+    conn.execute("""
+        INSERT INTO budget_notifications (ssh_key, last_notified_cents, last_notified_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(ssh_key) DO UPDATE SET
+            last_notified_cents = excluded.last_notified_cents,
+            last_notified_at = excluded.last_notified_at
+    """, (ssh_key, notified_cents, now))
     conn.commit()
 
 

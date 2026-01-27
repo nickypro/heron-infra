@@ -8,9 +8,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import yaml
+
 import utils_db as db
 
 PROJECT_DIR = Path(__file__).parent.parent
+DATA_DIR = PROJECT_DIR / "data"
+BUDGETS_FILE = DATA_DIR / "budgets.yaml"
 
 
 def load_config():
@@ -29,6 +33,25 @@ def load_config():
 CONFIG = load_config()
 MIN_RUNTIME_HOURS = float(CONFIG.get("MIN_RUNTIME_HOURS", "4"))
 IDLE_SHUTDOWN_HOURS = float(CONFIG.get("IDLE_SHUTDOWN_HOURS", "2"))
+DEFAULT_BUDGET_LIMIT = int(CONFIG.get("BUDGET_LIMIT_DEFAULT", "500000"))
+
+
+def load_budgets() -> dict:
+    """Load budgets.yaml if it exists."""
+    if BUDGETS_FILE.exists():
+        with open(BUDGETS_FILE) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def get_budget_for_key(data: dict, ssh_key: str) -> tuple[int, int]:
+    """Get (limit_cents, spent_cents) for an SSH key."""
+    default_limit = data.get("defaults", {}).get("limit_cents", DEFAULT_BUDGET_LIMIT)
+    key_config = data.get("keys", {}).get(ssh_key, {})
+    limit = key_config.get("limit_cents", "default")
+    if limit == "default" or limit is None:
+        limit = default_limit
+    return int(limit)
 
 
 def format_duration(hours: float) -> str:
@@ -208,7 +231,7 @@ def get_status_indicator(stats: dict, instance: dict) -> str:
         return "⚪ UNKNOWN"
 
 
-def print_instance_status(instance: dict, stats: dict, cost_cents: int):
+def print_instance_status(instance: dict, stats: dict, cost_cents: int, budget_info: dict | None = None):
     """Print compact formatted status for an instance."""
     hostname = instance.get("hostname") or f"lambda-{instance['id'][:8]}"
     custom_name = instance.get("name")  # User-set name on Lambda Labs
@@ -260,6 +283,19 @@ def print_instance_status(instance: dict, stats: dict, cost_cents: int):
     status = get_status_indicator(stats, instance)
     cost = format_cost(cost_cents)
     
+    # Budget info
+    budget_str = ""
+    if budget_info:
+        limit = budget_info.get("limit", 0)
+        spent = budget_info.get("spent", 0)
+        remaining = limit - spent
+        if remaining < 0:
+            budget_str = f"⚠ OVER BUDGET by {format_cost(-remaining)}"
+        elif remaining < limit * 0.2:
+            budget_str = f"! {format_cost(remaining)} left of {format_cost(limit)}"
+        else:
+            budget_str = f"{format_cost(remaining)} left of {format_cost(limit)}"
+    
     W = 72  # inner width
     # Use custom name as title if set, otherwise hostname
     title = custom_name if custom_name else hostname
@@ -275,6 +311,9 @@ def print_instance_status(instance: dict, stats: dict, cost_cents: int):
     print(f"│{line1:<{W}}│")
     line2 = f"  Key: {ssh_key:<18}  Cost: {cost:<8}  Samples: {stats['samples_24h']} (24h)"
     print(f"│{line2:<{W}}│")
+    if budget_str:
+        line2b = f"  Budget: {budget_str}"
+        print(f"│{line2b:<{W}}│")
     line3 = f"  {gpu_label}: {gpu_now:<4} now, {gpu_1h:<4} 1h avg"
     print(f"│{line3:<{W}}│")
     line4 = f"  Runtime: {runtime_str:<6} (min {MIN_RUNTIME_HOURS}h) {runtime_check}"
@@ -304,6 +343,10 @@ def main():
                 print("No active instances found.")
             return
         
+        # Load budget config and costs
+        budget_data = load_budgets()
+        all_costs = {c["ssh_key"]: c["total_cents"] for c in db.get_all_costs(conn)}
+        
         # Build results with stats
         results = []
         for inst in active:
@@ -312,10 +355,20 @@ def main():
             if isinstance(ssh_keys, str):
                 ssh_keys = json.loads(ssh_keys)
             cost = get_cost_for_key(conn, ssh_keys[0]) if ssh_keys else 0
+            
+            # Get budget info for this instance's SSH key
+            budget_info = None
+            if ssh_keys:
+                ssh_key = ssh_keys[0]
+                limit = get_budget_for_key(budget_data, ssh_key)
+                spent = all_costs.get(ssh_key, 0)
+                budget_info = {"limit": limit, "spent": spent}
+            
             results.append({
                 "instance": inst,
                 "stats": stats,
                 "cost_cents": cost,
+                "budget_info": budget_info,
             })
         
         # Sort: active first (is_active=True), then by GPU usage descending
@@ -329,6 +382,7 @@ def main():
                 ssh_keys = inst.get("ssh_key_names", [])
                 if isinstance(ssh_keys, str):
                     ssh_keys = json.loads(ssh_keys)
+                budget_info = r.get("budget_info")
                 output.append({
                     "id": inst["id"],
                     "hostname": inst.get("hostname"),
@@ -340,6 +394,8 @@ def main():
                     "first_seen": inst.get("first_seen"),
                     "last_seen": inst.get("last_seen"),
                     "cost_cents": r["cost_cents"],
+                    "budget_limit_cents": budget_info["limit"] if budget_info else None,
+                    "budget_spent_cents": budget_info["spent"] if budget_info else None,
                     "current_gpu_pct": stats["current_gpu"],
                     "avg_gpu_1h_pct": stats["avg_gpu_1h"],
                     "runtime_hours": stats["runtime_hours"],
@@ -356,7 +412,7 @@ def main():
             print(f"  {len(active)} active instance(s)\n")
             
             for r in results:
-                print_instance_status(r["instance"], r["stats"], r["cost_cents"])
+                print_instance_status(r["instance"], r["stats"], r["cost_cents"], r.get("budget_info"))
                 print()
             
     finally:

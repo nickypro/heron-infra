@@ -8,6 +8,7 @@ keys/*
 # Data directory (except examples)
 data/state.db
 data/*.json
+data/budgets.yaml
 
 # Backups
 ./backup

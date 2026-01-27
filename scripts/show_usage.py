@@ -9,9 +9,49 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import yaml
+
 import utils_db as db
 
 PROJECT_DIR = Path(__file__).parent.parent
+DATA_DIR = PROJECT_DIR / "data"
+BUDGETS_FILE = DATA_DIR / "budgets.yaml"
+
+
+def load_config():
+    """Load config.env for defaults."""
+    config_path = PROJECT_DIR / "config.env"
+    config = {}
+    if config_path.exists():
+        with open(config_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    config[key.strip()] = value.strip()
+    return config
+
+
+CONFIG = load_config()
+DEFAULT_LIMIT = int(CONFIG.get("BUDGET_LIMIT_DEFAULT", "500000"))
+
+
+def load_budgets() -> dict:
+    """Load budgets.yaml if it exists."""
+    if BUDGETS_FILE.exists():
+        with open(BUDGETS_FILE) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def get_limit_for_key(data: dict, ssh_key: str) -> int:
+    """Get the effective limit for an SSH key (custom or default)."""
+    default_limit = data.get("defaults", {}).get("limit_cents", DEFAULT_LIMIT)
+    key_config = data.get("keys", {}).get(ssh_key, {})
+    limit = key_config.get("limit_cents", "default")
+    if limit == "default" or limit is None:
+        return default_limit
+    return int(limit)
 
 
 def format_cost(cents: float) -> str:
@@ -131,51 +171,72 @@ def main():
             all_keys.update(period_usage.keys())
         all_keys.update(all_time.keys())
         
+        # Load budget config
+        budget_data = load_budgets()
+        
         if args.json:
             output = {}
             for key in sorted(all_keys):
+                limit = get_limit_for_key(budget_data, key)
+                total = all_time.get(key, {}).get("cost_cents", 0)
                 output[key] = {
                     "1h": usage_data["1h"].get(key, {}).get("cost_cents", 0),
                     "24h": usage_data["24h"].get(key, {}).get("cost_cents", 0),
                     "7d": usage_data["7d"].get(key, {}).get("cost_cents", 0),
-                    "total": all_time.get(key, {}).get("cost_cents", 0),
+                    "total": total,
+                    "limit": limit,
+                    "remaining": limit - total,
                 }
             print(json.dumps(output, indent=2))
         else:
-            print(f"\n  Usage by SSH Key  │  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            default_limit = budget_data.get("defaults", {}).get("limit_cents", DEFAULT_LIMIT)
+            print(f"\n  Usage by SSH Key  │  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"  Default budget: {format_cost(default_limit)}\n")
             
             if not all_keys:
                 print("  No usage data found.\n")
                 return
             
             # Header
-            print(f"  {'SSH Key':<24} │ {'1 Hour':>10} │ {'24 Hours':>10} │ {'7 Days':>10} │ {'Total':>10}")
-            print(f"  {'-'*24}-┼-{'-'*10}-┼-{'-'*10}-┼-{'-'*10}-┼-{'-'*10}")
+            print(f"  {'SSH Key':<20} │ {'24 Hours':>9} │ {'Total':>10} │ {'Limit':>10} │ {'Remaining':>10}")
+            print(f"  {'-'*20}-┼-{'-'*9}-┼-{'-'*10}-┼-{'-'*10}-┼-{'-'*10}")
             
             # Sort by total cost descending
             sorted_keys = sorted(all_keys, key=lambda k: all_time.get(k, {}).get("cost_cents", 0), reverse=True)
             
-            totals = {"1h": 0, "24h": 0, "7d": 0, "total": 0}
+            totals = {"24h": 0, "total": 0}
             
             for key in sorted_keys:
-                cost_1h = usage_data["1h"].get(key, {}).get("cost_cents", 0)
                 cost_24h = usage_data["24h"].get(key, {}).get("cost_cents", 0)
-                cost_7d = usage_data["7d"].get(key, {}).get("cost_cents", 0)
                 cost_total = all_time.get(key, {}).get("cost_cents", 0)
+                limit = get_limit_for_key(budget_data, key)
+                remaining = limit - cost_total
                 
-                totals["1h"] += cost_1h
                 totals["24h"] += cost_24h
-                totals["7d"] += cost_7d
                 totals["total"] += cost_total
                 
                 # Truncate long key names
-                display_key = key[:24] if len(key) <= 24 else key[:21] + "..."
+                display_key = key[:20] if len(key) <= 20 else key[:17] + "..."
                 
-                print(f"  {display_key:<24} │ {format_cost(cost_1h):>10} │ {format_cost(cost_24h):>10} │ {format_cost(cost_7d):>10} │ {format_cost(cost_total):>10}")
+                # Show limit as "*" if using default
+                key_config = budget_data.get("keys", {}).get(key, {})
+                limit_val = key_config.get("limit_cents", "default")
+                limit_str = format_cost(limit) if limit_val != "default" and limit_val is not None else f"{format_cost(limit)}*"
+                
+                # Remaining with status
+                if remaining < 0:
+                    remaining_str = f"{format_cost(remaining)} ⚠"
+                elif remaining < limit * 0.2:
+                    remaining_str = f"{format_cost(remaining)} !"
+                else:
+                    remaining_str = format_cost(remaining)
+                
+                print(f"  {display_key:<20} │ {format_cost(cost_24h):>9} │ {format_cost(cost_total):>10} │ {limit_str:>10} │ {remaining_str:>10}")
             
             # Totals row
-            print(f"  {'-'*24}-┼-{'-'*10}-┼-{'-'*10}-┼-{'-'*10}-┼-{'-'*10}")
-            print(f"  {'TOTAL':<24} │ {format_cost(totals['1h']):>10} │ {format_cost(totals['24h']):>10} │ {format_cost(totals['7d']):>10} │ {format_cost(totals['total']):>10}")
+            print(f"  {'-'*20}-┼-{'-'*9}-┼-{'-'*10}-┼-{'-'*10}-┼-{'-'*10}")
+            print(f"  {'TOTAL':<20} │ {format_cost(totals['24h']):>9} │ {format_cost(totals['total']):>10} │ {'-':>10} │ {'-':>10}")
+            print(f"\n  * = using default limit, ! = <20% left, ⚠ = over budget")
             
             print()
             

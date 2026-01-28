@@ -1,16 +1,16 @@
 # heron-infra
 
-Manages Lambda Labs GPU instances from a proxy machine. Tracks GPU usage, shuts down idle instances, keeps SSH config updated, and backs up data.
+Manages Lambda Labs GPU instances from a proxy machine. Tracks GPU usage, shuts down idle instances, keeps SSH config updated, backs up data, and monitors availability patterns.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-cp config.env.example config.env
-# add your LAMBDA_API_KEY to config.env
+cp data/accounts.yaml.example data/accounts.yaml
+# add your Lambda API keys to data/accounts.yaml
 ```
 
-Put your SSH keys in `./keys/`, named to match the key names in Lambda:
+Put SSH keys in `./keys/`, named to match the key names in Lambda:
 
 ```
 keys/
@@ -37,12 +37,34 @@ Install cron jobs:
 
 | Script | Cron | Description |
 |--------|------|-------------|
-| `monitor.py` | every 1 min | Collects GPU stats, updates `~/.ssh/config`, tracks costs |
-| `terminate_idle_instances.py` | every 5 min | Terminates instances that are idle too long |
-| `backup.py` | every 30 min | Backs up `~/` to `./backup/instances/`, volumes to `./backup/volumes/{region}/` |
-| `monitor_availability.py` | every 10 min | Records instance type availability by region |
-| `show_instances.py` | manual | Shows current instance status |
+| `monitor.py` | 1 min | Collects GPU stats, updates `~/.ssh/config`, tracks costs |
+| `terminate_idle_instances.py` | 5 min | Terminates instances idle too long |
+| `enforce_budgets.py` | 5 min | Terminates instances when account exceeds budget |
+| `backup.py` | 30 min | Backs up `~/` and persistent volumes |
+| `monitor_availability.py` | 10 min | Records GPU availability by region |
+| `show_instances.py` | manual | Shows instance status |
+| `show_availability.py` | manual | Shows availability patterns |
 | `show_usage.py` | manual | Shows cost per SSH key |
+
+## Multi-Account Setup
+
+Configure accounts in `data/accounts.yaml`:
+
+```yaml
+defaults:
+  limit_cents: 500000           # $5000 default budget
+  milestone_interval: 100000    # notify every $1000
+
+accounts:
+  team-research:
+    api_key: "secret_xxx"
+    limit_cents: 1000000        # $10,000
+    discord_webhook: "https://discord.com/api/webhooks/..."
+  
+  team-prod:
+    api_key: "secret_yyy"
+    limit_cents: default        # uses $5000 default
+```
 
 ## Termination Policy
 
@@ -52,54 +74,56 @@ Instances are terminated when **both** conditions are met:
 
 ### Whitelisting
 
-To prevent an instance from being auto-terminated, include **"whitelist"** in the instance name on Lambda Labs (case-insensitive):
+Include **"whitelist"** in the instance name to prevent auto-termination:
 
 - `my-training-whitelist` ✓
-- `whitelist-experiment` ✓
 - `WHITELIST-prod` ✓
 
-Whitelisted instances show 🔒 status and are never terminated by the script.
+## Budget Management
 
-## show_instances.py
+Set per-account budgets in `accounts.yaml`. When an account exceeds its budget:
+1. Discord notification sent (if webhook configured)
+2. All instances terminated
 
-```
-  Lambda Instance Status  │  2026-01-22 18:41:05
-  Termination: ≥4.0h runtime AND ≥2.0h idle
-  2 active instance(s)
+Override by including **"OVERBUDGET"** in instance name to keep it running.
 
-┌─ my-instance ───────────────────────────────────────────────────────────┐
-│  🟢 ACTIVE      IP: 192.0.2.1        Type: gpu_8x_a100                  │
-│  Key: alice-key           Cost: $12.50    Samples: 120 (24h)           │
-│  GPUs(8): 75%  now, 68%  1h avg                                        │
-│  Runtime: 3h13m  (min 4.0h) (46m to go)                                │
-│  Idle:    0m     (max 2.0h) (not idle)                                 │
-│  First: Jan 22 10:00   Last: Jan 22 16:32                              │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-Status indicators:
-- 🟢 ACTIVE - GPU in use
-- 🟡 IDLE - GPU at 0%
-- 🟠 PROTECTED - Would terminate but runtime protection active
-- 🔴 TERMINATE - Will be terminated
-- 🔒 WHITELIST - Never auto-terminated
-
-## monitor_availability.py
+## Availability Monitoring
 
 ```bash
-python3 scripts/monitor_availability.py              # show current availability
-python3 scripts/monitor_availability.py --record     # record to database
-python3 scripts/monitor_availability.py --history 24 # show last 24 hours
+# Show availability patterns (last 7 days)
+python3 scripts/show_availability.py
+
+# Filter by region or GPU type
+python3 scripts/show_availability.py --region us-west-1
+python3 scripts/show_availability.py --gpu a100
+
+# Show best times to launch
+python3 scripts/show_availability.py --summary --by-time
+python3 scripts/show_availability.py --summary --by-gpu
 ```
+
+Output shows a heatmap of when each GPU type was available:
+
+```
+  GPU Availability Patterns  │  2026-01-28 15:00:00
+  Based on 716 checks over 7 days
+
+  ┌─ us-west-1 ──────────────────────────────────────────────────────────────┐
+  │            Mon    Tue    Wed    Thu    Fri    Sat    Sun                 │
+  │ 1x_gh200   ██████ ██████ ██████ ██████ ██████ ██████ ██████  95%         │
+  │ 8x_a100    ▓▓▓▓▓▓ ▓▓▓▓▓▓ ██████ ██████ ▓▓▓▓▓▓ ▒▒▒▒▒▒ ░░░░░░  62%         │
+  └──────────────────────────────────────────────────────────────────────────┘
+```
+
+Legend: `██` >75% | `▓▓` >50% | `▒▒` >25% | `░░` >0% | `··` never | `  ` no data
 
 ## Config
 
-See `config.env.example`:
+`config.env` settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LAMBDA_API_KEY` | - | From cloud.lambdalabs.com/api-keys |
-| `MIN_RUNTIME_HOURS` | 4 | Min runtime before termination allowed |
+| `MIN_RUNTIME_HOURS` | 4 | Min runtime before termination |
 | `IDLE_SHUTDOWN_HOURS` | 2 | Hours at 0% GPU before termination |
 | `SSH_KEYS_DIR` | ./keys | Directory containing SSH keys |
 | `BACKUP_DIR` | ./backup | Where backups are stored |
@@ -117,6 +141,6 @@ crontab -l | sed '/# BEGIN HERON-INFRA/,/# END HERON-INFRA/d' | crontab -
 ## Data
 
 - SQLite database: `data/state.db`
-- JSON exports: `data/*.json` (for easy inspection)
+- Account config: `data/accounts.yaml`
 - Logs: `logs/`
 - Backups: `backup/instances/` and `backup/volumes/{region}/`

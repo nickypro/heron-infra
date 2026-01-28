@@ -10,6 +10,8 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+import yaml
+
 import utils_db as db
 import utils_lambda_api as lambda_api
 
@@ -21,9 +23,28 @@ def log(msg: str):
     print(f"[{ts}] {msg}")
 
 
+def get_api_key() -> str:
+    """Get an API key to use for availability checks (any valid key works)."""
+    accounts_file = PROJECT_DIR / "data" / "accounts.yaml"
+    if not accounts_file.exists():
+        raise RuntimeError("No accounts configured in data/accounts.yaml")
+    
+    with open(accounts_file) as f:
+        data = yaml.safe_load(f)
+    
+    accounts = data.get("accounts", {})
+    if not accounts:
+        raise RuntimeError("No accounts configured in data/accounts.yaml")
+    
+    # Get first account's API key
+    first_account = next(iter(accounts.values()))
+    return first_account["api_key"]
+
+
 def fetch_and_record_availability(conn):
     """Fetch current availability and record to database."""
-    types = lambda_api.list_instance_types()
+    api_key = get_api_key()
+    types = lambda_api.list_instance_types(api_key)
     
     recorded = 0
     for type_name, data in types.items():
@@ -37,7 +58,8 @@ def fetch_and_record_availability(conn):
 
 def get_current_availability():
     """Get current availability (live from API)."""
-    types = lambda_api.list_instance_types()
+    api_key = get_api_key()
+    types = lambda_api.list_instance_types(api_key)
     
     # Group by availability
     available = {}

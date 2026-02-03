@@ -10,6 +10,9 @@ data/state.db
 data/*.json
 data/budgets.yaml
 data/accounts.yaml
+data/emails.csv
+data/public_keys.txt
+data/heron.db
 
 # Backups
 ./backup

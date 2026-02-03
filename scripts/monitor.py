@@ -212,7 +212,7 @@ def initialize_machine(instance: dict) -> bool:
     key_path = get_ssh_key_for_instance(instance)
     log(f"Initializing machine {instance.get('name')} ({ip}) with key {key_path.name}...")
     
-    # Copy init script to remote
+    # SCP options for all copy operations
     scp_opts = [
         "-F", "/dev/null",  # Ignore SSH config to avoid path issues
         "-o", "StrictHostKeyChecking=no",
@@ -220,16 +220,30 @@ def initialize_machine(instance: dict) -> bool:
         "-i", str(key_path),
     ]
     
-    scp_cmd = ["scp"] + scp_opts + [str(init_script), f"{SSH_USER}@{ip}:/tmp/init_machine.sh"]
+    # Files to copy: (local_path, remote_path)
+    files_to_copy = [
+        (init_script, "/tmp/init_machine.sh"),
+        (PROJECT_DIR / "data" / "public_keys.txt", "/tmp/public_keys.txt"),
+        (PROJECT_DIR / "scripts" / "setup_ssh_keys.sh", "/tmp/setup_ssh_keys.sh"),
+    ]
     
-    try:
-        result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            log(f"Failed to copy init script: {result.stderr}")
+    for local_path, remote_path in files_to_copy:
+        if not local_path.exists():
+            # Skip optional files (public_keys.txt, setup_ssh_keys.sh)
+            if local_path.name != "init_machine.sh":
+                continue
+            log(f"Required file not found: {local_path}")
             return False
-    except Exception as e:
-        log(f"Failed to copy init script: {e}")
-        return False
+        
+        scp_cmd = ["scp"] + scp_opts + [str(local_path), f"{SSH_USER}@{ip}:{remote_path}"]
+        try:
+            result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                log(f"Failed to copy {local_path.name}: {result.stderr}")
+                return False
+        except Exception as e:
+            log(f"Failed to copy {local_path.name}: {e}")
+            return False
     
     # Run init script
     exit_code, output = ssh_command(ip, "chmod +x /tmp/init_machine.sh && /tmp/init_machine.sh", key_path, timeout=300)

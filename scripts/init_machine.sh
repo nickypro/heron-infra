@@ -6,6 +6,12 @@ set -e
 
 echo "Initializing machine..."
 
+# Setup SSH keys (from public_keys.txt, copied by monitor.py)
+if [ -f /tmp/setup_ssh_keys.sh ]; then
+    chmod +x /tmp/setup_ssh_keys.sh
+    /tmp/setup_ssh_keys.sh /tmp/public_keys.txt
+fi
+
 cd ~
 
 # Clone dotfiles
@@ -14,7 +20,7 @@ if [ ! -d ~/.vps-dotfiles ]; then
 fi
 
 # Run zsh setup
-bash ~/.vps-dotfiles/zsh_install.sh
+bash ~/.vps-dotfiles/zsh_install.sh || true
 
 # Clone heron-infra
 if [ ! -d ~/.heron-infra ]; then
@@ -35,8 +41,10 @@ fi
 # Install uv
 if ! command -v uv &> /dev/null; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="$HOME/.local/bin:$PATH"
 fi
+
+# Ensure uv is in PATH (needed for non-interactive SSH sessions)
+export PATH="$HOME/.local/bin:$PATH"
 
 # Create virtual environment
 mkdir -p ~/.venv
